@@ -104,7 +104,7 @@
 #include "fast_lio_sam/save_map.h"
 #include "fast_lio_sam/save_pose.h"
 
-// save data in kitti format 
+// save data in kitti / tum format 
 #include <sstream>
 #include <fstream>
 #include <iomanip>
@@ -232,6 +232,7 @@ ros::Publisher pubCloudRegisteredRaw;
 ros::Publisher pubLoopConstraintEdge;
 
 bool aLoopIsClosed = false;
+bool gpsisfound  = false ;
 map<int, int> loopIndexContainer; // from new to old
 vector<pair<int, int>> loopIndexQueue;
 vector<gtsam::Pose3> loopPoseQueue;
@@ -275,11 +276,23 @@ Eigen::MatrixXd poseCovariance;
 ros::Publisher pubLaserCloudSurround;
 ros::Publisher pubOptimizedGlobalMap ;           //   发布最后优化的地图
 
-bool    recontructKdTree = false;
-int updateKdtreeCount = 0 ;        //  每100次更新一次
+//reconstruct
+bool    reconstructKdTree = false;
+bool if_reconstruct_ikdtree_map_add_gps = false;               // true: reconstruct ikdtree map when add gps factor
+bool if_reconstruct_ikdtree_map_loop_closure = true;          // true: reconstruct ikdtree map when loop closure
+int  reconstruct_ikdtree_mode_add_gps = 1;                     // 0: reconstruct the ikdtree map with riduas frame; 1: reconstruct the ikdtree map with a fixed frame(例如时间上的邻近五个关键帧)
+int  reconstruct_ikdtree_mode_loop_closure = 0;
+int  reconstruct_ikdtree_frame = 5;                   // number of frames for reconstructing ikdtree map when reconstruct_ikdtree_mode=1
+float reconstruct_ikdtree_search_radius = 100.0;  
+float reconstruct_pose_density = 10.0;
+float reconstruct_map_leafsize = 0.5;                             // meters, downsample point cloud for reconstructing ikdtree map
+int add_gps_num_reconstruct = 0;
+
+int updateKdtreeCount = 0 ;        //  重构的请求次数统计
 bool visulize_IkdtreeMap = false;            //  visual iktree submap
 
 // gnss
+bool use_gnss = false ;
 double last_timestamp_gnss = -1.0 ;
 deque<nav_msgs::Odometry> gnss_buffer;
 geometry_msgs::PoseStamped msg_gnss_pose;
@@ -287,6 +300,7 @@ string gnss_topic ;
 bool useImuHeadingInitialization;   
 bool useGpsElevation;             //  是否使用gps高层优化
 float gpsCovThreshold;          //   gps方向角和高度差的协方差阈值
+float gpsNoiseMin;              //   GPS 因子最小噪声下限（原来固定 1.0）
 float poseCovThreshold;       //  位姿协方差阈值  from isam2
 
 M3D Gnss_R_wrt_Lidar(Eye3d) ;         // gnss  与 imu 的外参
@@ -298,12 +312,14 @@ ros::Publisher pubGnssPath ;
 nav_msgs::Path gps_path ;
 vector<double>       extrinT_Gnss2Lidar(3, 0.0);
 vector<double>       extrinR_Gnss2Lidar(9, 0.0);
-
+Eigen::Matrix3d R_world_imu; //初始化gnss时，东北天坐标系到imu系的旋转矩阵
 
 // global map visualization radius
 float globalMapVisualizationSearchRadius;
 float globalMapVisualizationPoseDensity;
 float globalMapVisualizationLeafSize;
+
+
 
 // saveMap
 ros::ServiceServer srvSaveMap;
@@ -656,18 +672,31 @@ void addLoopFactor()
 void addGPSFactor()
 {
     if (gnss_buffer.empty())
+    {
+        ROS_INFO("[GPS] addGPSFactor: gnss_buffer is empty, return");
         return;
+    }
     // 如果没有关键帧，或者首尾关键帧距离小于5m，不添加gps因子
     if (cloudKeyPoses3D->points.empty())
+    {
+        ROS_INFO("[GPS] addGPSFactor: cloudKeyPoses3D is empty, return");
         return;
+    }
     else
     {
-        if (pointDistance(cloudKeyPoses3D->front(), cloudKeyPoses3D->back()) < 5.0)
+        if (pointDistance(cloudKeyPoses3D->front(), cloudKeyPoses3D->back()) < 5.0 && pointDistance(cloudKeyPoses3D->front(), cloudKeyPoses3D->back()) > 6.0)
+        {
+            ROS_INFO("[GPS] addGPSFactor: first and last keyframe distance < 5m, return");
             return;
+        }
     }
     // 位姿协方差很小，没必要加入GPS数据进行校正
-    if (poseCovariance(3,3) < poseCovThreshold && poseCovariance(4,4) < poseCovThreshold)
-        return;
+    // if (poseCovariance(3,3) < poseCovThreshold && poseCovariance(4,4) < poseCovThreshold)
+        
+    // {
+    //     cout<<"11111111"<<endl;
+    //     ROS_INFO("[GPS] addGPSFactor: pose covariance below threshold, return");
+    //     return; }
     static PointType lastGPSPoint;      // 最新的gps数据
     while (!gnss_buffer.empty())
     {
@@ -679,6 +708,7 @@ void addGPSFactor()
         // 超过当前帧0.2s之后，退出
         else if (gnss_buffer.front().header.stamp.toSec() > lidar_end_time + 0.05)
         {
+            ROS_INFO("[GPS] addGPSFactor: gnss time > lidar_end_time + 0.05, break");
             break;
         }
         else
@@ -690,7 +720,11 @@ void addGPSFactor()
             float noise_y = thisGPS.pose.covariance[7];
             float noise_z = thisGPS.pose.covariance[14];      //   z(高层)方向的协方差
             if (noise_x > gpsCovThreshold || noise_y > gpsCovThreshold)
-                continue;
+
+                {
+                    // cout<<"22222222"<<endl;
+                    ROS_INFO("[GPS] addGPSFactor: GNSS covariance too large, continue");
+                    continue;}
             // GPS里程计位置
             float gps_x = thisGPS.pose.pose.position.x;
             float gps_y = thisGPS.pose.pose.position.y;
@@ -703,24 +737,33 @@ void addGPSFactor()
 
             // (0,0,0)无效数据
             if (abs(gps_x) < 1e-6 && abs(gps_y) < 1e-6)
+            {
+                ROS_INFO("[GPS] addGPSFactor: invalid (0,0,*) GNSS position, continue");
                 continue;
+            }
             // 每隔5m添加一个GPS里程计
             PointType curGPSPoint;
             curGPSPoint.x = gps_x;
             curGPSPoint.y = gps_y;
             curGPSPoint.z = gps_z;
-            if (pointDistance(curGPSPoint, lastGPSPoint) < 5.0)
+            if (pointDistance(curGPSPoint, lastGPSPoint) < 5.0 && pointDistance(curGPSPoint, lastGPSPoint) > 6.0){
+                // cout<<"33333333"<<endl;
+                ROS_INFO("[GPS] addGPSFactor: distance to last GPS < 5m, continue");
                 continue;
+            }
+            
             else
                 lastGPSPoint = curGPSPoint;
             // 添加GPS因子
             gtsam::Vector Vector3(3);
-            Vector3 << max(noise_x, 1.0f), max(noise_y, 1.0f), max(noise_z, 1.0f);
+            Vector3 << max(noise_x, gpsNoiseMin), max(noise_y, gpsNoiseMin), max(noise_z, gpsNoiseMin);
             gtsam::noiseModel::Diagonal::shared_ptr gps_noise = gtsam::noiseModel::Diagonal::Variances(Vector3);
             gtsam::GPSFactor gps_factor(cloudKeyPoses3D->size(), gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
             gtSAMgraph.add(gps_factor);
-            aLoopIsClosed = true;
+
+            gpsisfound = true;
             ROS_INFO("GPS Factor Added");
+            ROS_INFO("[GPS] addGPSFactor: added GPS factor and break loop");
             break;
         }
     }
@@ -734,7 +777,9 @@ void saveKeyFramesAndFactor()
     // 激光里程计因子(from fast-lio),  输入的是frame_relative pose  帧间位姿(body 系下)
     addOdomFactor();
     // GPS因子 (UTM -> WGS84)
-    addGPSFactor();
+    if (use_gnss){
+        addGPSFactor();
+    }    
     // 闭环因子 (rs-loop-detect)  基于欧氏距离的检测
     addLoopFactor();
     // 执行优化
@@ -818,8 +863,16 @@ void saveKeyFramesAndFactor()
     updatePath(thisPose6D); //  可视化update后的path
 }
 
-void recontructIKdTree(){
-    if(recontructKdTree  &&  updateKdtreeCount >  0){
+void reconstructIKdTree(int construct_mode){
+    if(reconstructKdTree){
+        if (cloudKeyPoses3D->empty())
+        {
+            ROS_WARN("[reconstructIKdTree] cloudKeyPoses3D is empty, skip reconstruct");
+            updateKdtreeCount++;
+            return;
+        }
+
+        double t_recon_start = omp_get_wtime();
         /*** if path is too large, the rvis will crash ***/
         pcl::KdTreeFLANN<PointType>::Ptr kdtreeGlobalMapPoses(new pcl::KdTreeFLANN<PointType>());
         pcl::PointCloud<PointType>::Ptr subMapKeyPoses(new pcl::PointCloud<PointType>());
@@ -830,42 +883,98 @@ void recontructIKdTree(){
         // kdtree查找最近一帧关键帧相邻的关键帧集合
         std::vector<int> pointSearchIndGlobalMap;
         std::vector<float> pointSearchSqDisGlobalMap;
-        mtx.lock();
-        kdtreeGlobalMapPoses->setInputCloud(cloudKeyPoses3D);
-        kdtreeGlobalMapPoses->radiusSearch(cloudKeyPoses3D->back(), globalMapVisualizationSearchRadius, pointSearchIndGlobalMap, pointSearchSqDisGlobalMap, 0);
-        mtx.unlock();
-
-        for (int i = 0; i < (int)pointSearchIndGlobalMap.size(); ++i)
+        double t_search_start = omp_get_wtime();
+        if (construct_mode == 0)
+        {
+            mtx.lock();
+            kdtreeGlobalMapPoses->setInputCloud(cloudKeyPoses3D);
+            kdtreeGlobalMapPoses->radiusSearch(cloudKeyPoses3D->back(), reconstruct_ikdtree_search_radius, pointSearchIndGlobalMap, pointSearchSqDisGlobalMap, 0);
+            mtx.unlock();
+        }
+        else if (construct_mode == 1)
+        {
+            size_t total_keyframes = cloudKeyPoses3D->size();
+            size_t frames_to_use = std::min(static_cast<size_t>(reconstruct_ikdtree_frame), total_keyframes);
+            size_t start_idx = total_keyframes - frames_to_use;
+            pointSearchIndGlobalMap.reserve(frames_to_use);
+            for (size_t idx = start_idx; idx < total_keyframes; ++idx)
+            {
+                pointSearchIndGlobalMap.push_back(static_cast<int>(idx));
+            }
+        }
+        else
+        {
+            ROS_WARN_THROTTLE(1.0, "[reconstructIKdTree] unsupported construct_mode=%d, fallback to mode 0", construct_mode);
+            mtx.lock();
+            kdtreeGlobalMapPoses->setInputCloud(cloudKeyPoses3D);
+            kdtreeGlobalMapPoses->radiusSearch(cloudKeyPoses3D->back(), reconstruct_ikdtree_search_radius, pointSearchIndGlobalMap, pointSearchSqDisGlobalMap, 0);
+            mtx.unlock();
+        }
+        double t_search_end = omp_get_wtime();
+        int max_frame = reconstruct_ikdtree_frame;
+        int frame_available = std::min(max_frame, (int)pointSearchIndGlobalMap.size());
+        for (int i = 0; i < frame_available; ++i){
             subMapKeyPoses->push_back(cloudKeyPoses3D->points[pointSearchIndGlobalMap[i]]);     //  subMap的pose集合
-        // 降采样
-        pcl::VoxelGrid<PointType> downSizeFilterSubMapKeyPoses;
-        downSizeFilterSubMapKeyPoses.setLeafSize(globalMapVisualizationPoseDensity, globalMapVisualizationPoseDensity, globalMapVisualizationPoseDensity); // for global map visualization
-        downSizeFilterSubMapKeyPoses.setInputCloud(subMapKeyPoses);
-        downSizeFilterSubMapKeyPoses.filter(*subMapKeyPosesDS);         //  subMap poses  downsample
+            
+        }
+        double t_ds_pose_start = omp_get_wtime();
+        if (construct_mode == 0)
+        {
+            // 仅 mode 0 需要对关键帧位姿做体素降采样
+            // pcl::VoxelGrid<PointType> downSizeFilterSubMapKeyPoses;
+            // downSizeFilterSubMapKeyPoses.setLeafSize(reconstruct_pose_density, reconstruct_pose_density, reconstruct_pose_density);
+            // downSizeFilterSubMapKeyPoses.setInputCloud(subMapKeyPoses);
+            // downSizeFilterSubMapKeyPoses.filter(*subMapKeyPosesDS);
+            *subMapKeyPosesDS = *subMapKeyPoses;
+            //因为其实在取关键帧的时候就规定了要间隔一定距离（取10）才能作为关键帧，这里也是对关键帧进行降采样，也是取差不多的值，效果不大
+        }
+        else
+        {
+            // mode 1 直接使用按时间选出的关键帧序列
+            *subMapKeyPosesDS = *subMapKeyPoses;
+        }
+        double t_ds_pose_end = omp_get_wtime();
         // 提取局部相邻关键帧对应的特征点云
+        double t_collect_start = omp_get_wtime();
         for (int i = 0; i < (int)subMapKeyPosesDS->size(); ++i)
         {
-            // 距离过大
-            if (pointDistance(subMapKeyPosesDS->points[i], cloudKeyPoses3D->back()) > globalMapVisualizationSearchRadius)
-                    continue;
+            
+            // // 距离过滤
+            // if (pointDistance(subMapKeyPosesDS->points[i], cloudKeyPoses3D->back()) > reconstruct_ikdtree_search_radius)
+            //         continue;
             int thisKeyInd = (int)subMapKeyPosesDS->points[i].intensity;
             // *globalMapKeyFrames += *transformPointCloud(cornerCloudKeyFrames[thisKeyInd],  &cloudKeyPoses6D->points[thisKeyInd]);
             *subMapKeyFrames += *transformPointCloud(surfCloudKeyFrames[thisKeyInd], &cloudKeyPoses6D->points[thisKeyInd]); //  fast_lio only use  surfCloud
         }
+        double t_collect_end = omp_get_wtime();
         // 降采样，发布
+        double t_ds_map_start = omp_get_wtime();
         pcl::VoxelGrid<PointType> downSizeFilterGlobalMapKeyFrames;                                                                                   // for global map visualization
-        downSizeFilterGlobalMapKeyFrames.setLeafSize(globalMapVisualizationLeafSize, globalMapVisualizationLeafSize, globalMapVisualizationLeafSize); // for global map visualization
+        downSizeFilterGlobalMapKeyFrames.setLeafSize(reconstruct_map_leafsize, reconstruct_map_leafsize, reconstruct_map_leafsize); // for global map visualization
         downSizeFilterGlobalMapKeyFrames.setInputCloud(subMapKeyFrames);
         downSizeFilterGlobalMapKeyFrames.filter(*subMapKeyFramesDS);
+        double t_ds_map_end = omp_get_wtime();
 
         std::cout << "subMapKeyFramesDS sizes  =  "   << subMapKeyFramesDS->points.size()  << std::endl;
-        
+        double t_rebuild_start = omp_get_wtime();
         ikdtree.reconstruct(subMapKeyFramesDS->points);
+        double t_rebuild_end = omp_get_wtime();
         updateKdtreeCount = 0;
-        ROS_INFO("Reconstructed  ikdtree ");
+        ROS_INFO("Reconstructed ikdtree");
         int featsFromMapNum = ikdtree.validnum();
         kdtree_size_st = ikdtree.size();
         std::cout << "featsFromMapNum  =  "   << featsFromMapNum   <<  "\t" << " kdtree_size_st   =  "  <<  kdtree_size_st  << std::endl;
+
+        double total_ms      = (t_recon_start   - t_recon_start) * 1000.0; // 占位，下面直接按子阶段相加
+        double search_ms     = (t_search_end    - t_search_start) * 1000.0;
+        double ds_pose_ms    = (t_ds_pose_end   - t_ds_pose_start) * 1000.0;
+        double collect_ms    = (t_collect_end   - t_collect_start) * 1000.0;
+        double ds_map_ms     = (t_ds_map_end    - t_ds_map_start) * 1000.0;
+        double rebuild_ms    = (t_rebuild_end   - t_rebuild_start) * 1000.0;
+        double recon_ms      = (t_rebuild_end   - t_recon_start) * 1000.0;
+
+        ROS_INFO("[TIME][reconstructIKdTree] search=%.3f ms, ds_pose=%.3f ms, collect=%.3f ms, ds_map=%.3f ms, rebuild=%.3f ms, total=%.3f ms",
+                 search_ms, ds_pose_ms, collect_ms, ds_map_ms, rebuild_ms, recon_ms);
     }
         updateKdtreeCount ++ ; 
 }
@@ -878,7 +987,7 @@ void correctPoses()
     if (cloudKeyPoses3D->points.empty())
         return;
 
-    if (aLoopIsClosed == true)
+    if (aLoopIsClosed == true||gpsisfound == true)
     {
         // 清空里程计轨迹
         globalPath.poses.clear();
@@ -901,8 +1010,21 @@ void correctPoses()
             updatePath(cloudKeyPoses6D->points[i]);
         }
         // 清空局部map， reconstruct  ikdtree submap
-        recontructIKdTree();
+        double t_correct_start = omp_get_wtime();
+        if (aLoopIsClosed && if_reconstruct_ikdtree_map_loop_closure){
+            updateKdtreeCount++;
+            reconstructIKdTree(reconstruct_ikdtree_mode_loop_closure);
+        }
+        else if(gpsisfound && if_reconstruct_ikdtree_map_add_gps){
+            updateKdtreeCount++;
+            if (updateKdtreeCount >= add_gps_num_reconstruct){
+            reconstructIKdTree(reconstruct_ikdtree_mode_add_gps);
+            }
+        }
+        double t_correct_end = omp_get_wtime();
         ROS_INFO("ISMA2 Update");
+        ROS_INFO("[TIME] reconstruct cost: %.3f ms", (t_correct_end - t_correct_start) * 1000.0);
+        gpsisfound = false;
         aLoopIsClosed = false;
     }
 }
@@ -1102,17 +1224,12 @@ void SigHandle(int sig)
 
 inline void dump_lio_state_to_log(FILE *fp)
 {
-    V3D rot_ang(Log(state_point.rot.toRotationMatrix()));
-    fprintf(fp, "%lf ", Measures.lidar_beg_time - first_lidar_time);
-    fprintf(fp, "%lf %lf %lf ", rot_ang(0), rot_ang(1), rot_ang(2));                            // Angle
-    fprintf(fp, "%lf %lf %lf ", state_point.pos(0), state_point.pos(1), state_point.pos(2));    // Pos
-    fprintf(fp, "%lf %lf %lf ", 0.0, 0.0, 0.0);                                                 // omega
-    fprintf(fp, "%lf %lf %lf ", state_point.vel(0), state_point.vel(1), state_point.vel(2));    // Vel
-    fprintf(fp, "%lf %lf %lf ", 0.0, 0.0, 0.0);                                                 // Acc
-    fprintf(fp, "%lf %lf %lf ", state_point.bg(0), state_point.bg(1), state_point.bg(2));       // Bias_g
-    fprintf(fp, "%lf %lf %lf ", state_point.ba(0), state_point.ba(1), state_point.ba(2));       // Bias_a
-    fprintf(fp, "%lf %lf %lf ", state_point.grav[0], state_point.grav[1], state_point.grav[2]); // Bias_a
-    fprintf(fp, "\r\n");
+    // TUM format: timestamp x y z qx qy qz qw
+    const auto &p = odomAftMapped.pose.pose.position;
+    const auto &q = odomAftMapped.pose.pose.orientation;
+    double t = Measures.lidar_beg_time; // or lidar_end_time
+    fprintf(fp, "%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+            t, p.x, p.y, p.z, q.x, q.y, q.z, q.w);
     fflush(fp);
 }
 
@@ -1355,6 +1472,8 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
 {
     //  ROS_INFO("GNSS DATA IN ");
+    if (use_gnss== false)
+        return;
     double timestamp = msg_in->header.stamp.toSec();
 
     mtx_buffer.lock();
@@ -1379,26 +1498,56 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
     mtx_buffer.unlock();
    
     if(!gnss_inited){           //  初始化位置
-        gnss_data.InitOriginPosition(msg_in->latitude, msg_in->longitude, msg_in->altitude) ; 
+        gnss_data.InitOriginPosition(msg_in->latitude, msg_in->longitude, msg_in->altitude) ;
+        sensor_msgs::Imu::ConstPtr first_late_imu;
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer);  // 保护 imu_buffer
+            for (const auto &imu_msg : imu_buffer) {
+                double t_imu = imu_msg->header.stamp.toSec();
+                if (t_imu >= timestamp) {
+                    first_late_imu = imu_msg;
+                    break;
+                }
+            }
+        }
+
+        if (!first_late_imu) {
+            ROS_WARN("[GNSS] no IMU with t >= first GNSS yet, wait for next GNSS");
+            return;                // 这次 GNSS 先结束，不置 gnss_inited
+        }
+
+        // 找到了第一帧晚于 GNSS 的 IMU，算旋转
+        const auto &q = first_late_imu->orientation;
+        Eigen::Quaterniond q_imu(q.w, q.x, q.y, q.z);
+        R_world_imu = q_imu.toRotationMatrix();
+        Eigen::Vector3d euler_zyx = R_world_imu.eulerAngles(2, 1, 0); // yaw, pitch, roll
+
+        ROS_INFO_STREAM("[GNSS] first IMU after GNSS t=" << first_late_imu->header.stamp.toSec()
+                        << " yaw="   << euler_zyx[0]
+                        << " pitch=" << euler_zyx[1]
+                        << " roll="  << euler_zyx[2]); 
         gnss_inited = true ;
-    }else{                               //   初始化完成
+    }else{
+        if (gnss_data.status != 0)
+            return;                               //   初始化完成
         gnss_data.UpdateXYZ(msg_in->latitude, msg_in->longitude, msg_in->altitude) ;             //  WGS84 -> ENU  ???  调试结果好像是 NED 北东地
 
-        Eigen::Matrix4d gnss_pose = Eigen::Matrix4d::Identity();
-        gnss_pose(0,3) = gnss_data.local_N ;                 //    北
-        gnss_pose(1,3) = gnss_data.local_E ;                 //     东
-        gnss_pose(2,3) = -gnss_data.local_U ;                 //    地
+        Eigen::Vector3d gnss_pose = Eigen::Vector3d::Zero() ;
+        gnss_pose(0) = gnss_data.local_E ;                 //    东
+        gnss_pose(1) = gnss_data.local_N ;                 //    北
+        gnss_pose(2) = gnss_data.local_U ;                 //    天
 
-        Eigen::Isometry3d gnss_to_lidar(Gnss_R_wrt_Lidar) ;
-        gnss_to_lidar.pretranslate(Gnss_T_wrt_Lidar);
-        gnss_pose  =  gnss_to_lidar  *  gnss_pose ;                    //  gnss 转到 lidar 系下, （当前Gnss_T_wrt_Lidar，只是一个大致的初值）
-
+        // Eigen::Isometry3d gnss_to_lidar(Gnss_R_wrt_Lidar) ;
+        // gnss_to_lidar.pretranslate(Gnss_T_wrt_Lidar);
+        // gnss_pose  =  gnss_to_lidar  *  gnss_pose ;                    //  gnss 转到 lidar 系下, （当前Gnss_T_wrt_Lidar，只是一个大致的初值）
+        gnss_pose  =  R_world_imu.transpose()*gnss_pose ;        //  东北天系 转到 世界imu 系
+        // cout<<" gnss_pose  = \n"<< gnss_pose <<endl;
         nav_msgs::Odometry gnss_data_enu ;
         // add new message to buffer:
         gnss_data_enu.header.stamp = ros::Time().fromSec(gnss_data.time);
-        gnss_data_enu.pose.pose.position.x =  gnss_pose(0,3) ;  //gnss_data.local_E ;   北
-        gnss_data_enu.pose.pose.position.y =  gnss_pose(1,3) ;  //gnss_data.local_N;    东
-        gnss_data_enu.pose.pose.position.z =  gnss_pose(2,3) ;  //  地
+        gnss_data_enu.pose.pose.position.x =  gnss_pose(0) ;  //gnss_data.local_E ;   北
+        gnss_data_enu.pose.pose.position.y =  gnss_pose(1) ;  //gnss_data.local_N;    东
+        gnss_data_enu.pose.pose.position.z =  gnss_pose(2) ;  //  地
 
         gnss_data_enu.pose.pose.orientation.x =  geoQuat.x ;                //  gnss 的姿态不可观，所以姿态只用于可视化，取自imu
         gnss_data_enu.pose.pose.orientation.y =  geoQuat.y;
@@ -1415,9 +1564,10 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
         msg_gnss_pose.header.frame_id = "camera_init";
         msg_gnss_pose.header.stamp = ros::Time().fromSec(gnss_data.time);
 
-        msg_gnss_pose.pose.position.x = gnss_pose(0,3) ;  
-        msg_gnss_pose.pose.position.y = gnss_pose(1,3) ;
-        msg_gnss_pose.pose.position.z = gnss_pose(2,3) ;
+        msg_gnss_pose.pose.position.x = gnss_pose(0) ;  
+        msg_gnss_pose.pose.position.y = gnss_pose(1) ;
+        msg_gnss_pose.pose.position.z = gnss_pose(2) ;
+        // cout<<" gnss_data.pose.pose.position.x  = "<< gnss_data_enu.pose.pose.position.x  <<endl;
 
         gps_path.poses.push_back(msg_gnss_pose);
 
@@ -1433,6 +1583,7 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
         thisPose6D.time = lidar_end_time;
         gnss_cloudKeyPoses6D->push_back(thisPose6D);   
     }
+
 
 
 }
@@ -1668,7 +1819,7 @@ void set_posestamp(T &out)
     out.pose.orientation.z = geoQuat.z;
     out.pose.orientation.w = geoQuat.w;
 }
-
+void append_tum_pose();
 void publish_odometry(const ros::Publisher &pubOdomAftMapped)
 {
     odomAftMapped.header.frame_id = "camera_init";
@@ -1700,6 +1851,42 @@ void publish_odometry(const ros::Publisher &pubOdomAftMapped)
     q.setZ(odomAftMapped.pose.pose.orientation.z);
     transform.setRotation(q);
     br.sendTransform(tf::StampedTransform(transform, odomAftMapped.header.stamp, "camera_init", "body"));
+
+    // append current optimized pose in TUM format to file
+    append_tum_pose();
+}
+
+// append current pose in TUM format: t x y z qx qy qz qw
+// pose source: optimized odometry (odomAftMapped)
+void append_tum_pose()
+{
+    static std::ofstream tum_ofs;
+    static bool tum_inited = false;
+
+    if (!tum_inited)
+    {
+        std::string home = std::getenv("HOME") ? std::getenv("HOME") : std::string(".");
+        std::string tum_path = home + std::string("/fast_lio_sam_pose_tum.txt");
+        tum_ofs.open(tum_path, std::ios::out);
+        if (!tum_ofs.is_open())
+        {
+            ROS_ERROR("Failed to open TUM pose file: %s", tum_path.c_str());
+            return;
+        }
+        tum_inited = true;
+    }
+
+    const auto &p = odomAftMapped.pose.pose.position;
+    const auto &q = odomAftMapped.pose.pose.orientation;
+
+    // use lidar_end_time as timestamp (double seconds)
+    double t = lidar_end_time;
+
+    tum_ofs << std::fixed << std::setprecision(6)
+            << t << " "
+            << p.x << " " << p.y << " " << p.z << " "
+            << q.x << " " << q.y << " " << q.z << " " << q.w
+            << std::endl;
 }
 
 void publish_path(const ros::Publisher pubPath)
@@ -2177,12 +2364,14 @@ int main(int argc, char **argv)
     nh.param<float>("historyKeyframeFitnessScore", historyKeyframeFitnessScore, 0.3);
 
     // gnss
+    nh.param<bool>("use_gnss", use_gnss, false);
     nh.param<string>("common/gnss_topic", gnss_topic,"/gps/fix");
     nh.param<vector<double>>("mapping/extrinR_Gnss2Lidar", extrinR_Gnss2Lidar, vector<double>());
     nh.param<vector<double>>("mapping/extrinT_Gnss2Lidar", extrinT_Gnss2Lidar, vector<double>());
     nh.param<bool>("useImuHeadingInitialization", useImuHeadingInitialization, false);
     nh.param<bool>("useGpsElevation", useGpsElevation, false);
     nh.param<float>("gpsCovThreshold", gpsCovThreshold, 2.0);
+    nh.param<float>("gpsNoiseMin", gpsNoiseMin, 1.0);
     nh.param<float>("poseCovThreshold", poseCovThreshold, 25.0);
 
 
@@ -2195,7 +2384,16 @@ int main(int argc, char **argv)
     nh.param<bool>("visulize_IkdtreeMap", visulize_IkdtreeMap, false);
 
     // reconstruct ikdtree 
-    nh.param<bool>("recontructKdTree", recontructKdTree, false);
+    nh.param<bool>("reconstructKdTree", reconstructKdTree, false);
+    nh.param<bool>("if_reconstruct_ikdtree_map_add_gps", if_reconstruct_ikdtree_map_add_gps, false);
+    nh.param<bool>("if_reconstruct_ikdtree_map_loop_closure", if_reconstruct_ikdtree_map_loop_closure, false);
+    nh.param<int>("reconstruct_ikdtree_mode_add_gps", reconstruct_ikdtree_mode_add_gps, 1);
+    nh.param<int>("reconstruct_ikdtree_mode_loop_closure", reconstruct_ikdtree_mode_loop_closure, 0);
+    nh.param<int>("reconstruct_ikdtree_frame", reconstruct_ikdtree_frame, 5);
+    nh.param<float>("reconstruct_ikdtree_search_radius", reconstruct_ikdtree_search_radius, 100.0);
+    nh.param<float>("reconstruct_pose_density", reconstruct_pose_density, 10.0);
+    nh.param<float>("reconstruct_map_leafsize", reconstruct_map_leafsize, 0.5);
+    nh.param<int>("add_gps_num_reconstruct", add_gps_num_reconstruct, 3);
 
     // savMap
     nh.param<bool>("savePCD", savePCD, false);
@@ -2252,7 +2450,9 @@ int main(int argc, char **argv)
 
     /*** debug record ***/
     FILE *fp;
-    string pos_log_dir = root_dir + "/Log/pos_log.txt";
+    string pos_log_dir = root_dir + "/Log";
+    boost::filesystem::create_directories(pos_log_dir);
+    pos_log_dir += "/pos.txt";
     fp = fopen(pos_log_dir.c_str(), "w");
 
     ofstream fout_pre, fout_out, fout_dbg;
@@ -2436,6 +2636,21 @@ int main(int argc, char **argv)
             t3 = omp_get_wtime();
             map_incremental();
             t5 = omp_get_wtime();
+
+            // 打印当前帧各阶段耗时（单位：ms）
+            double imu_propagate_time_ms   = (t1 - t0) * 1000.0;                 // IMU+去畸变+下采样前
+            double t2_t1        = (t2-t1) * 1000.0;
+            double ekf_update_time_ms      = (t_update_end - t2) * 1000.0; // 前端匹配+ESKF/迭代更新
+            double backend_opt_time_ms     = (t3 - t_update_end) * 1000.0;                 // saveKeyFramesAndFactor + correctPoses + 发布里程计
+            double kdtree_incremental_ms   = (t5 - t3) * 1000.0;                 // 点云加入 ikdtree
+            double total_frame_time_ms     = (t5 - t0) * 1000.0;                 // 整帧总时间
+
+            ROS_INFO_STREAM("[TIME] frame=" << frame_num
+                            << " imu_pre+downsample(ms)=" << imu_propagate_time_ms
+                            << " ekf_update(ms)=" << ekf_update_time_ms
+                            << " backend_opt(ms)=" << backend_opt_time_ms
+                            << " kdtree_update(ms)=" << kdtree_incremental_ms
+                            << " total(ms)=" << total_frame_time_ms);
             /******* Publish points *******/
             if (path_en){
                 publish_path(pubPath);
