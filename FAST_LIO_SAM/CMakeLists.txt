@@ -40,7 +40,21 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}   ${OpenMP_C_FLAGS}")
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "/usr/share/cmake/geographiclib/")
 
-find_package(PythonLibs REQUIRED)
+# 使用新的Python3查找方式（CMake 3.12+）
+# 优先使用Python3，如果失败则回退到PythonLibs
+find_package(Python3 QUIET COMPONENTS Development Interpreter)
+if(Python3_FOUND)
+    set(PYTHON_INCLUDE_DIRS ${Python3_INCLUDE_DIRS})
+    set(PYTHON_LIBRARIES ${Python3_LIBRARIES})
+    message(STATUS "Found Python3: ${Python3_VERSION}")
+    message(STATUS "  Include dirs: ${Python3_INCLUDE_DIRS}")
+else()
+    # 回退到旧的方式
+    find_package(PythonLibs REQUIRED)
+    set(PYTHON_INCLUDE_DIRS ${PYTHON_INCLUDE_DIRS})
+    set(PYTHON_LIBRARIES ${PYTHON_LIBRARIES})
+    message(STATUS "Found PythonLibs (legacy)")
+endif()
 find_path(MATPLOTLIB_CPP_INCLUDE_DIRS "matplotlibcpp.h")
 
 find_package(catkin REQUIRED COMPONENTS
@@ -56,7 +70,7 @@ find_package(catkin REQUIRED COMPONENTS
   message_generation
   eigen_conversions
 )
-
+find_package(OpenCV REQUIRED QUIET)
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package (GeographicLib REQUIRED)
@@ -70,6 +84,7 @@ include_directories(
 	${catkin_INCLUDE_DIRS} 
   ${EIGEN3_INCLUDE_DIR}
   ${PCL_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
   ${PYTHON_INCLUDE_DIRS}
   ${GTSAM_INCLUDE_DIR}
   ${GeographicLib_INCLUDE_DIRS}
@@ -109,6 +124,10 @@ catkin_package(
 
 add_library(ikd_Tree include/ikd-Tree/ikd_Tree.cpp)
 add_library(preprocess  src/preprocess.cpp)
-add_executable(fastlio_sam_mapping src/laserMapping.cpp)
+add_executable(fastlio_sam_mapping src/laserMapping.cpp src/Scancontext.cpp)
 target_link_libraries(fastlio_sam_mapping ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES}  ${GeographicLib_LIBRARIES} ikd_Tree preprocess gtsam) 
 target_include_directories(fastlio_sam_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
+
+# Target pointcloud extractor node
+add_executable(target_pointcloud_extractor src/target_pointcloud_extractor.cpp)
+target_link_libraries(target_pointcloud_extractor ${catkin_LIBRARIES} ${PCL_LIBRARIES})

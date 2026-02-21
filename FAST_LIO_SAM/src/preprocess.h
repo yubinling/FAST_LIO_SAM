@@ -10,6 +10,7 @@ using namespace std;
 typedef pcl::PointXYZINormal PointType;
 typedef pcl::PointCloud<PointType> PointCloudXYZI;
 
+enum TIME_UNIT{SEC = 0, MS = 1, US = 2, NS = 3};
 enum LID_TYPE{AVIA = 1, VELO16, OUST64, RS128}; //{1, 2, 3, 4}
 enum Feature{Nor, Poss_Plane, Real_Plane, Edge_Jump, Edge_Plane, Wire, ZeroPoint};//未判断，可能平面，平面，跳跃边，平面交接边,细线
 enum Surround{Prev, Next};
@@ -136,7 +137,9 @@ class Preprocess
   PointCloudXYZI pl_full, pl_corn, pl_surf; //储存全部点(特征提取或间隔采样后）、角点、面特征点
   PointCloudXYZI pl_buff[128]; //maximum 128 line lidar
   vector<orgtype> typess[128]; //maximum 128 line lidar
-  int lidar_type, point_filter_num, N_SCANS, SCAN_RATE;
+  float time_unit_scale;
+  int lidar_type, point_filter_num, N_SCANS, SCAN_RATE,time_unit;
+  int timestamp_unit; // 时间戳单位: 0-second, 1-milisecond, 2-microsecond, 3-nanosecond
   double blind; //xy平面距离，小于此阈值不计算特征
   bool feature_enabled, given_offset_time;
   ros::Publisher pub_full, pub_surf, pub_corn;

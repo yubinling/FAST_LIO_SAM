@@ -62,6 +62,7 @@
 
 #include <std_msgs/Header.h>
 #include <std_msgs/Float64MultiArray.h>
+#include <std_msgs/String.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <sensor_msgs/NavSatFix.h>
@@ -95,7 +96,10 @@
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/nonlinear/ISAM2.h>
+#include <Scancontext.h>
 
+#include "factorgraph_opt.h"
+#include "tracked_object.h"
 // gnss
 #include "GNSS_Processing.hpp"
 #include "sensor_msgs/NavSatFix.h"
@@ -138,18 +142,20 @@ double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
-double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
+double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_start_time=0,lidar_end_time = 0, first_lidar_time = 0.0;
 int effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
 int iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 bool point_selected_surf[100000] = {0}; // 是否为平面特征点
 bool lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+bool dense_keyframe = true;  // true: 关键帧存储feats_undistort(去畸变完整点云), false: 存储feats_down_body(降采样点云)
 
 vector<vector<int>> pointSearchInd_surf;
 vector<BoxPointType> cub_needrm; // ikd-tree中，地图需要移除的包围盒序列
 vector<PointVector> Nearest_Points;
 vector<double> extrinT(3, 0.0);
 vector<double> extrinR(9, 0.0);
+vector<double> t_imu_gnss_vec(3, 0.0);
 deque<double> time_buffer;               // 记录lidar时间
 deque<PointCloudXYZI::Ptr> lidar_buffer; //记录特征提取或间隔采样后的lidar（特征）数据
 deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
@@ -174,6 +180,7 @@ V3D euler_cur;
 V3D position_last(Zero3d);
 V3D Lidar_T_wrt_IMU(Zero3d); // T lidar to imu (imu = r * lidar + t)
 M3D Lidar_R_wrt_IMU(Eye3d);  // R lidar to imu (imu = r * lidar + t)
+V3D t_imu_gnss(Zero3d);      // T IMU to GNSS (GNSS = IMU + t_imu_gnss)
 
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
@@ -201,6 +208,17 @@ pcl::PointCloud<PointTypePose>::Ptr copy_cloudKeyPoses6D(new pcl::PointCloud<Poi
 pcl::PointCloud<PointTypePose>::Ptr fastlio_unoptimized_cloudKeyPoses6D(new pcl::PointCloud<PointTypePose>()); //  存储fastlio 未优化的位姿
 pcl::PointCloud<PointTypePose>::Ptr gnss_cloudKeyPoses6D(new pcl::PointCloud<PointTypePose>()); //  gnss 轨迹
 
+
+// 物体轨迹管理
+struct ObjectTrajectory {
+    int object_id;
+    std::vector<Eigen::Vector3f> positions;  // 历史位置
+    bool is_active;  // 是否仍在追踪
+    ros::Time last_seen;  // 最后一次观测时间
+};
+std::map<int, ObjectTrajectory> object_trajectories;  // object_id -> trajectory
+
+
 // voxel filter paprams
 float odometrySurfLeafSize;
 float mappingCornerLeafSize;
@@ -222,7 +240,36 @@ float historyKeyframeSearchRadius;   // 回环检测 radius kdtree搜索半径
 float historyKeyframeSearchTimeDiff; //  帧间时间阈值
 int historyKeyframeSearchNum;        //   回环时多少个keyframe拼成submap
 float historyKeyframeFitnessScore;   // icp 匹配阈值
+float loopClosureNoiseScore;         // 闭环检测噪声值（用于因子图优化）
 bool potentialLoopFlag = false;
+
+// limot
+int window_size;
+double egoP_egoP;
+double egoP_objP;
+double objP_objP_chgP;
+double chgP_chgP;
+double ego_stationObjP;
+double rubostNum;
+bool if_dynamic;
+// bool pubtrackedobjects;
+bool if_priorfactor;
+std::string sequence;
+int laserCloudInfoHandler_size;
+float vel_threshold;
+float Scorethre;
+
+Eigen::Vector3d last_pos;
+Eigen::Vector3d last_rot;//roll pitch yaw
+
+factorgraph::FactorGraph local_graph;
+gtsam::NonlinearFactorGraph graph_temp;
+vector<LidarSLAMFrame, Eigen::aligned_allocator<LidarSLAMFrame>> frames;
+Tracker tracker;
+int flow = 0;
+map<int, std::vector<int>> priorfactor_id;
+map<int, std::vector<int>> priorfactor_egoP_id;
+map<int, std::vector<std::pair<int, int>>> priorfactor_objP_id; //<flow,<f_id,obj_k>>
 
 ros::Publisher pubHistoryKeyFrames; //  发布 loop history keyframe submap
 ros::Publisher pubIcpKeyFrames;
@@ -230,16 +277,31 @@ ros::Publisher pubRecentKeyFrames;
 ros::Publisher pubRecentKeyFrame;
 ros::Publisher pubCloudRegisteredRaw;
 ros::Publisher pubLoopConstraintEdge;
+// ros::Publisher pubTrackObjects;  //发布跟踪物体的边界框
+ros::Publisher pubTrackedObjects;
+ros::Publisher pubObjectTrajectories;
+ros::Subscriber subDetect;
+
 
 bool aLoopIsClosed = false;
 bool gpsisfound  = false ;
 map<int, int> loopIndexContainer; // from new to old
 vector<pair<int, int>> loopIndexQueue;
 vector<gtsam::Pose3> loopPoseQueue;
-vector<gtsam::noiseModel::Diagonal::shared_ptr> loopNoiseQueue;
+// vector<gtsam::noiseModel::Diagonal::shared_ptr> loopNoiseQueue;
+vector<gtsam::SharedNoiseModel> loopNoiseQueue;
 deque<std_msgs::Float64MultiArray> loopInfoVec;
+std::deque<std_msgs::Float64MultiArray> decQueue;
 
 nav_msgs::Path globalPath;
+
+//track需要用的前后帧位姿数据
+Eigen::Affine3f transPointAssociateToMap;
+Eigen::Affine3f incrementalOdometryAffineFront;
+Eigen::Affine3f incrementalOdometryAffineBack;
+
+// // loop detector 回环检测
+SCManager scManager;
 
 // 局部关键帧构建的map点云，对应kdtree，用于scan-to-map找相邻点
 pcl::KdTreeFLANN<PointType>::Ptr kdtreeCornerFromMap(new pcl::KdTreeFLANN<PointType>());
@@ -254,10 +316,18 @@ pcl::VoxelGrid<PointType> downSizeFilterCorner;
 pcl::VoxelGrid<PointType> downSizeFilterICP;
 pcl::VoxelGrid<PointType> downSizeFilterSurroundingKeyPoses; // for surrounding key poses of scan-to-map optimization
 
+//动态剔除点
+    // filter dynamic points
+std::queue<std::vector<double>> dynamBoxBuf; // [x,y,z,yaw,l,w,h]
+pcl::CropBox<PointType> box_filter;
+// pcl::PointCloud<PointType>::Ptr cloud_filter_corner;
+pcl::PointCloud<PointType>::Ptr cloud_filter_surf;
+
 float transformTobeMapped[6]; //  当前帧的位姿(world系下)
 
 std::mutex mtx;
 std::mutex mtxLoopInfo;
+std::mutex decLock;
 
 // Surrounding map
 float surroundingkeyframeAddingDistThreshold;  //  判断是否为关键帧的距离阈值
@@ -275,6 +345,8 @@ Eigen::MatrixXd poseCovariance;
 
 ros::Publisher pubLaserCloudSurround;
 ros::Publisher pubOptimizedGlobalMap ;           //   发布最后优化的地图
+ros::Publisher pubOptimizedKeyFrames;            //   发布优化后的关键帧点云（5Hz）
+ros::Publisher pubGnssPoseGT;                   //   发布GNSS IMU位姿真值（TUM格式）
 
 //reconstruct
 bool    reconstructKdTree = false;
@@ -313,6 +385,8 @@ nav_msgs::Path gps_path ;
 vector<double>       extrinT_Gnss2Lidar(3, 0.0);
 vector<double>       extrinR_Gnss2Lidar(9, 0.0);
 Eigen::Matrix3d R_world_imu; //初始化gnss时，东北天坐标系到imu系的旋转矩阵
+// 第一帧GNSS的IMU位姿（用于计算相对位姿）
+Eigen::Quaterniond first_gnss_imu_rot = Eigen::Quaterniond::Identity();  // 第一帧GNSS的东北天到IMU旋转（用于计算相对旋转）
 
 // global map visualization radius
 float globalMapVisualizationSearchRadius;
@@ -326,6 +400,7 @@ ros::ServiceServer srvSaveMap;
 ros::ServiceServer srvSavePose;
 bool savePCD;               // 是否保存地图
 string savePCDDirectory;    // 保存路径
+int mapSaveInterval = -1;   // 地图保存间隔（帧数），-1表示只在程序结束时保存，1表示每帧保存，N表示每N帧保存一次
 
 
 /**
@@ -522,6 +597,103 @@ void getCurPose(state_ikfom cur_state)
 /**
  * rviz展示闭环边
  */
+
+//     gtsam::Pose3 pclPointTogtsamPose3(PointTypePose thisPoint) {
+//     return gtsam::Pose3(gtsam::Rot3::RzRyRx(double(thisPoint.roll), double(thisPoint.pitch), double(thisPoint.yaw)),
+//         gtsam::Point3(double(thisPoint.x), double(thisPoint.y), double(thisPoint.z)));
+// }
+
+// gtsam::Pose3 trans2gtsamPose(float transformIn[]) {
+//     return gtsam::Pose3(gtsam::Rot3::RzRyRx(transformIn[0], transformIn[1], transformIn[2]),
+//         gtsam::Point3(transformIn[3], transformIn[4], transformIn[5]));
+// }
+
+// Eigen::Affine3f pclPointToAffine3f(PointTypePose thisPoint) {
+//     return pcl::getTransformation(thisPoint.x, thisPoint.y, thisPoint.z, thisPoint.roll, thisPoint.pitch, thisPoint.yaw);
+// }
+
+// Eigen::Affine3f trans2Affine3f(float transformIn[]) {
+//     return pcl::getTransformation(transformIn[3], transformIn[4], transformIn[5], transformIn[0], transformIn[1], transformIn[2]);
+// }
+Eigen::Affine3f gtsamPose3toAffine3f(gtsam::Pose3 transformIn) {
+    return pcl::getTransformation(transformIn.x(), transformIn.y(), transformIn.z(), transformIn.rotation().rpy()[0], transformIn.rotation().rpy()[1], transformIn.rotation().rpy()[2]);
+}
+// Affine3f -> Pose3
+gtsam::Pose3 Affine3f2Pose3(Eigen::Affine3f T) {
+    float roll, pitch, yaw, x, y, z;
+    roll = T.rotation().eulerAngles(0, 1, 2)[0];
+    pitch = T.rotation().eulerAngles(0, 1, 2)[1];
+    yaw = T.rotation().eulerAngles(0, 1, 2)[2];
+    x = T.translation()[0];
+    y = T.translation()[1];
+    z = T.translation()[2];
+    return gtsam::Pose3(gtsam::Rot3::RzRyRx(roll, pitch, yaw),
+        gtsam::Point3(x, y, z));
+}
+
+gtsam::Pose3 vec6ftoPose3(vector<float>& v) {
+    return gtsam::Pose3(gtsam::Rot3::RzRyRx(v[0], v[1], v[2]),
+        gtsam::Point3(v[3], v[4], v[5]));
+}
+
+bool Pose3tovec6f(gtsam::Pose3 transformIn, vector<float>& transformOut) {
+    transformOut.clear();
+    transformOut.resize(6);
+    Eigen::Affine3f T = gtsamPose3toAffine3f(transformIn);
+    transformOut[0] = T.rotation().eulerAngles(0, 1, 2)[0];
+    transformOut[1] = T.rotation().eulerAngles(0, 1, 2)[1];
+    transformOut[2] = T.rotation().eulerAngles(0, 1, 2)[2];
+    transformOut[3] = T.translation()[0];
+    transformOut[4] = T.translation()[1];
+    transformOut[5] = T.translation()[2];
+    return true;
+}
+bool Pose3tovec3f(gtsam::Pose3 transformIn, vector<float>& transformOut) {
+    transformOut.clear();
+    transformOut.resize(3);
+    Eigen::Affine3f T = gtsamPose3toAffine3f(transformIn);
+    transformOut[0] = T.translation()[0];
+    transformOut[1] = T.translation()[1];
+    transformOut[2] = T.translation()[2];
+    return true;
+}
+
+bool Affine3ftovec6f(Eigen::Affine3f T, vector<float>& transformOut) {
+    transformOut.clear();
+    transformOut.resize(6);
+    transformOut[0] = T.rotation().eulerAngles(0, 1, 2)[0];
+    transformOut[1] = T.rotation().eulerAngles(0, 1, 2)[1];
+    transformOut[2] = T.rotation().eulerAngles(0, 1, 2)[2];
+    transformOut[3] = T.translation()[0];
+    transformOut[4] = T.translation()[1];
+    transformOut[5] = T.translation()[2];
+    return true;
+}
+
+float* gtsamPose3totrans(gtsam::Pose3 transformIn) {
+    float* transformOut = new float[6];
+    Eigen::Affine3f T = gtsamPose3toAffine3f(transformIn);
+    transformOut[0] = T.rotation().eulerAngles(0, 1, 2)[0];
+    transformOut[1] = T.rotation().eulerAngles(0, 1, 2)[1];
+    transformOut[2] = T.rotation().eulerAngles(0, 1, 2)[2];
+    transformOut[3] = T.translation()[0];
+    transformOut[4] = T.translation()[1];
+    transformOut[5] = T.translation()[2];
+    return transformOut;
+}
+
+
+// PointTypePose trans2PointTypePose(float transformIn[]) {
+//     PointTypePose thisPose6D;
+//     thisPose6D.x = transformIn[3];
+//     thisPose6D.y = transformIn[4];
+//     thisPose6D.z = transformIn[5];
+//     thisPose6D.roll = transformIn[0];
+//     thisPose6D.pitch = transformIn[1];
+//     thisPose6D.yaw = transformIn[2];
+//     return thisPose6D;
+// }
+
 void visualizeLoopClosure()
 {
     ros::Time timeLaserInfoStamp = ros::Time().fromSec(lidar_end_time); //  时间戳
@@ -585,6 +757,309 @@ void visualizeLoopClosure()
     pubLoopConstraintEdge.publish(markerArray);
 }
 
+//可视化跟踪
+// 根据object_id生成一致的颜色
+std::vector<float> generateColorFromID(int object_id) {
+    // 使用HSV颜色空间生成颜色，确保同一ID始终得到相同颜色
+    std::srand(object_id * 12345);  // 固定种子确保颜色一致
+    float hue = (float)(std::rand() % 360) / 360.0f;
+    float saturation = 0.8f + (float)(std::rand() % 20) / 100.0f;  // 0.8-1.0
+    float value = 0.8f + (float)(std::rand() % 20) / 100.0f;       // 0.8-1.0
+    
+    // HSV to RGB conversion
+    float c = value * saturation;
+    float x = c * (1.0f - std::abs(std::fmod(hue * 6.0f, 2.0f) - 1.0f));
+    float m = value - c;
+    
+    float r, g, b;
+    int h_i = (int)(hue * 6);
+    if (h_i == 0) { r = c; g = x; b = 0; }
+    else if (h_i == 1) { r = x; g = c; b = 0; }
+    else if (h_i == 2) { r = 0; g = c; b = x; }
+    else if (h_i == 3) { r = 0; g = x; b = c; }
+    else if (h_i == 4) { r = x; g = 0; b = c; }
+    else { r = c; g = 0; b = x; }
+    
+    std::vector<float> color = {r + m, g + m, b + m};
+    return color;
+}
+
+    // 可视化物体轨迹
+void visualizeObjectTrajectories() {
+    ros::Time timeLaserInfoStamp = ros::Time().fromSec(lidar_end_time);
+    string odometryFrame = "camera_init";
+    visualization_msgs::MarkerArray trajectoryMarkers;
+    int marker_id = 0;
+    
+    for (auto& pair : object_trajectories) {
+        int object_id = pair.first;
+        ObjectTrajectory& traj = pair.second;
+        
+        if (traj.positions.empty())
+            continue;
+        
+        std::vector<float> color = generateColorFromID(object_id);
+        
+        // 创建轨迹线
+        visualization_msgs::Marker lineMarker;
+        lineMarker.header.frame_id = odometryFrame;
+        lineMarker.header.stamp = timeLaserInfoStamp;
+        lineMarker.ns = "object_trajectories";
+        lineMarker.id = marker_id++;
+        lineMarker.type = visualization_msgs::Marker::LINE_STRIP;
+        lineMarker.action = visualization_msgs::Marker::ADD;
+        lineMarker.pose.orientation.w = 1.0;
+        lineMarker.scale.x = 0.05;  // 线宽
+        lineMarker.color.r = color[0];
+        lineMarker.color.g = color[1];
+        lineMarker.color.b = color[2];
+        lineMarker.color.a = traj.is_active ? 0.8 : 0.4;  // 失效的轨迹更透明
+        
+        for (const Eigen::Vector3f& pos : traj.positions) {
+            geometry_msgs::Point p;
+            p.x = pos.x();
+            p.y = pos.y();
+            p.z = pos.z();
+            lineMarker.points.push_back(p);
+        }
+        
+        trajectoryMarkers.markers.push_back(lineMarker);
+        
+        // 为每个位置添加小球体
+        for (size_t i = 0; i < traj.positions.size(); i++) {
+            visualization_msgs::Marker sphereMarker;
+            sphereMarker.header.frame_id = odometryFrame;
+            sphereMarker.header.stamp = timeLaserInfoStamp;
+            sphereMarker.ns = "trajectory_points";
+            sphereMarker.id = marker_id++;
+            sphereMarker.type = visualization_msgs::Marker::SPHERE;
+            sphereMarker.action = visualization_msgs::Marker::ADD;
+            
+            sphereMarker.pose.position.x = traj.positions[i].x();
+            sphereMarker.pose.position.y = traj.positions[i].y();
+            sphereMarker.pose.position.z = traj.positions[i].z();
+            sphereMarker.pose.orientation.w = 1.0;
+            
+            // 最后一个球体稍大
+            if (i == traj.positions.size() - 1) {
+                sphereMarker.scale.x = 0.3;
+                sphereMarker.scale.y = 0.3;
+                sphereMarker.scale.z = 0.3;
+            } else {
+                sphereMarker.scale.x = 0.15;
+                sphereMarker.scale.y = 0.15;
+                sphereMarker.scale.z = 0.15;
+            }
+            
+            sphereMarker.color.r = color[0];
+            sphereMarker.color.g = color[1];
+            sphereMarker.color.b = color[2];
+            sphereMarker.color.a = traj.is_active ? 0.9 : 0.6;  // 失效的球体更透明
+            
+            trajectoryMarkers.markers.push_back(sphereMarker);
+        }
+    }
+    
+    pubObjectTrajectories.publish(trajectoryMarkers);
+}
+
+void visualizeTrackedObjects() {
+    ros::Time timeLaserInfoStamp = ros::Time().fromSec(lidar_end_time);
+    string odometryFrame = "camera_init";
+    if (frames.empty()) {
+        ROS_WARN_THROTTLE(5, "visualizeTrackedObjects: frames is empty");
+        return;
+    }
+    
+    if (flow <= 0 || flow > (int)frames.size()) {
+        cout << "visualizeTrackedObjects: invalid flow=" << flow << ", frames.size()=" << frames.size() << endl;
+        return;
+    }
+    
+    // flow 已经递增了，所以当前要可视化的是 flow-1 帧
+    int current_frame_idx = flow - 1;
+    cout << "visualizeTrackedObjects called: flow=" << flow << ", current_frame_idx=" << current_frame_idx << ", frames.size()=" << frames.size() << endl;
+    
+    visualization_msgs::MarkerArray markerArray;
+    
+    // 【重要】先清除所有旧的边界框和标签，避免累积显示
+    visualization_msgs::Marker deleteMarker;
+    deleteMarker.header.frame_id = odometryFrame;
+    deleteMarker.header.stamp = timeLaserInfoStamp;
+    deleteMarker.action = visualization_msgs::Marker::DELETEALL;
+    
+    // 清除边界框
+    deleteMarker.ns = "tracked_boxes";
+    markerArray.markers.push_back(deleteMarker);
+    
+    // 清除标签
+    deleteMarker.ns = "tracked_labels";
+    markerArray.markers.push_back(deleteMarker);
+    
+    // 标记当前帧所有物体为非活跃
+    for (auto& pair : object_trajectories) {
+        pair.second.is_active = false;
+    }
+    
+    int marker_id = 0;
+    const LidarSLAMFrame& current_frame = frames[current_frame_idx];
+    
+    // 统计信息
+    int total_objects = current_frame.objects.size();
+    int initialized_count = 0;
+    int associated_count = 0;
+    
+    for (const LidarSLAMObject& obj : current_frame.objects) {
+        if (obj.initialized) initialized_count++;
+        if (obj.associated) associated_count++;
+        
+        // 显示所有已关联的物体（不仅仅是已初始化的）
+        // 这样可以更早地看到跟踪效果
+        if (!obj.associated || obj.object_id < 0) {
+            continue;
+        }
+        
+        int object_id = obj.object_id;
+        std::vector<float> color = generateColorFromID(object_id);
+        
+        // 使用优化后的位姿 (optimize_t: [roll, pitch, yaw, x, y, z])
+        float roll = obj.optimize_t[0];
+        float pitch = obj.optimize_t[1];
+        float yaw = obj.optimize_t[2];
+        float x = obj.optimize_t[3];
+        float y = obj.optimize_t[4];
+        float z = obj.optimize_t[5];
+        
+        float l = obj.measure_lwh[0];  // 长度
+        float w = obj.measure_lwh[1];  // 宽度
+        float h = obj.measure_lwh[2];  // 高度
+        
+        // 更新轨迹
+        if (object_trajectories.find(object_id) == object_trajectories.end()) {
+            ObjectTrajectory traj;
+            traj.object_id = object_id;
+            traj.is_active = true;
+            traj.last_seen = timeLaserInfoStamp;
+            object_trajectories[object_id] = traj;
+        }
+        object_trajectories[object_id].positions.push_back(Eigen::Vector3f(x, y, z));
+        object_trajectories[object_id].is_active = true;
+        object_trajectories[object_id].last_seen = timeLaserInfoStamp;
+        
+        // 创建3D边界框
+        visualization_msgs::Marker marker;
+        marker.header.frame_id = odometryFrame;
+        marker.header.stamp = timeLaserInfoStamp;
+        marker.ns = "tracked_boxes";
+        marker.id = marker_id++;
+        marker.type = visualization_msgs::Marker::LINE_LIST;
+        marker.action = visualization_msgs::Marker::ADD;
+        marker.pose.orientation.w = 1.0;
+        marker.scale.x = 0.08;  // 线宽
+        marker.color.r = color[0];
+        marker.color.g = color[1];
+        marker.color.b = color[2];
+        marker.color.a = 0.9;
+        
+        // 定义边界框的8个顶点（在物体坐标系中）
+        std::vector<Eigen::Vector3f> corners(8);
+        // 输出L、W、H和roll、pitch、yaw的值（用于调试）
+        // cout << "Object ID: " << object_id 
+        //      << ", L=" << l << "m, W=" << w << "m, H=" << h << "m"
+        //      << ", Roll=" << roll << "rad (" << roll*180.0/M_PI << "deg)"
+        //      << ", Pitch=" << pitch << "rad (" << pitch*180.0/M_PI << "deg)"
+        //      << ", Yaw=" << yaw << "rad (" << yaw*180.0/M_PI << "deg)" << endl;
+        corners[0] = Eigen::Vector3f(-l/2, -w/2, -h/2);
+        corners[1] = Eigen::Vector3f( l/2, -w/2, -h/2);
+        corners[2] = Eigen::Vector3f( l/2,  w/2, -h/2);
+        corners[3] = Eigen::Vector3f(-l/2,  w/2, -h/2);
+        corners[4] = Eigen::Vector3f(-l/2, -w/2,  h/2);
+        corners[5] = Eigen::Vector3f( l/2, -w/2,  h/2);
+        corners[6] = Eigen::Vector3f( l/2,  w/2,  h/2);
+        corners[7] = Eigen::Vector3f(-l/2,  w/2,  h/2);
+        
+        // 创建旋转矩阵（ZYX欧拉角顺序：先绕Z轴旋转yaw，再绕Y轴旋转pitch，最后绕X轴旋转roll）
+        // 对于车辆物体，通常只需要yaw角度（水平面旋转），roll和pitch为0
+        Eigen::Matrix3f R;
+        // 使用ZYX顺序，但注意Eigen的AngleAxis是右乘，所以顺序是：R_z * R_y * R_x
+        // 这意味着先应用X旋转，再应用Y旋转，最后应用Z旋转
+        // 但我们需要的是先Z（yaw），再Y（pitch），最后X（roll），所以顺序应该是正确的
+        // 但为了确保正确，我们直接使用欧拉角构造函数
+        R = Eigen::AngleAxisf(roll, Eigen::Vector3f::UnitX())
+            * Eigen::AngleAxisf(pitch, Eigen::Vector3f::UnitY())
+            * Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ());
+        
+        // 转换顶点到世界坐标系
+        std::vector<geometry_msgs::Point> points(8);
+        for (int j = 0; j < 8; j++) {
+            Eigen::Vector3f corner_world = R * corners[j] + Eigen::Vector3f(x, y, z);
+            points[j].x = corner_world.x();
+            points[j].y = corner_world.y();
+            points[j].z = corner_world.z();
+        }
+        
+        // 添加边界框的12条边
+        // 底面4条边
+        marker.points.push_back(points[0]); marker.points.push_back(points[1]);
+        marker.points.push_back(points[1]); marker.points.push_back(points[2]);
+        marker.points.push_back(points[2]); marker.points.push_back(points[3]);
+        marker.points.push_back(points[3]); marker.points.push_back(points[0]);
+        // 顶面4条边
+        marker.points.push_back(points[4]); marker.points.push_back(points[5]);
+        marker.points.push_back(points[5]); marker.points.push_back(points[6]);
+        marker.points.push_back(points[6]); marker.points.push_back(points[7]);
+        marker.points.push_back(points[7]); marker.points.push_back(points[4]);
+        // 4条竖边
+        marker.points.push_back(points[0]); marker.points.push_back(points[4]);
+        marker.points.push_back(points[1]); marker.points.push_back(points[5]);
+        marker.points.push_back(points[2]); marker.points.push_back(points[6]);
+        marker.points.push_back(points[3]); marker.points.push_back(points[7]);
+        
+        markerArray.markers.push_back(marker);
+        
+        // 添加物体ID文本标签
+        visualization_msgs::Marker textMarker;
+        textMarker.header.frame_id = odometryFrame;
+        textMarker.header.stamp = timeLaserInfoStamp;
+        textMarker.ns = "tracked_labels";
+        textMarker.id = marker_id++;
+        textMarker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        textMarker.action = visualization_msgs::Marker::ADD;
+        textMarker.pose.position.x = x;
+        textMarker.pose.position.y = y;
+        textMarker.pose.position.z = z + h/2 + 0.8;
+        textMarker.pose.orientation.w = 1.0;
+        textMarker.scale.z = 0.6;
+        textMarker.color.r = 1.0;
+        textMarker.color.g = 1.0;
+        textMarker.color.b = 1.0;
+        textMarker.color.a = 1.0;
+        
+        std::stringstream ss;
+        ss << "ID:" << object_id;
+        if (obj.dynamic) {
+            ss << " V:" << std::fixed << std::setprecision(1) << obj.velocity << "km/h";
+        }
+        textMarker.text = ss.str();
+        
+        markerArray.markers.push_back(textMarker);
+    }
+    
+    // 打印统计信息
+    int visualized_count = (markerArray.markers.size() - 2) / 2; // 减去2个DELETEALL，除以2（框+标签）
+    cout << "Tracked Objects - Total: " << total_objects 
+            << ", Associated: " << associated_count 
+            << ", Initialized: " << initialized_count 
+            << ", Visualized: " << visualized_count << endl;
+    
+    // 发布边界框（即使为空也发布，以清除旧的marker）
+    pubTrackedObjects.publish(markerArray);
+    cout << "Published " << markerArray.markers.size() << " markers to /limot/tracked_objects" << endl;
+    
+    // 可视化所有物体的轨迹
+    visualizeObjectTrajectories();
+}
+    
 /**
  * 计算当前帧与前一帧位姿变换，如果变化太小，不设为关键帧，反之设为关键帧
  */
@@ -656,7 +1131,8 @@ void addLoopFactor()
         int indexTo = loopIndexQueue[i].second;  //    pre
         // 闭环边的位姿变换
         gtsam::Pose3 poseBetween = loopPoseQueue[i];
-        gtsam::noiseModel::Diagonal::shared_ptr noiseBetween = loopNoiseQueue[i];
+        auto noiseBetween = loopNoiseQueue[i];
+        // gtsam::noiseModel::Diagonal::shared_ptr noiseBetween = loopNoiseQueue[i];
         gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(indexFrom, indexTo, poseBetween, noiseBetween));
     }
 
@@ -684,7 +1160,8 @@ void addGPSFactor()
     }
     else
     {
-        if (pointDistance(cloudKeyPoses3D->front(), cloudKeyPoses3D->back()) < 5.0 && pointDistance(cloudKeyPoses3D->front(), cloudKeyPoses3D->back()) > 6.0)
+        ROS_INFO("[GPS] addGPSFactor: current keyframe count = %lu", cloudKeyPoses3D->points.size());
+        if (pointDistance(cloudKeyPoses3D->front(), cloudKeyPoses3D->back()) < 0)
         {
             ROS_INFO("[GPS] addGPSFactor: first and last keyframe distance < 5m, return");
             return;
@@ -726,9 +1203,32 @@ void addGPSFactor()
                     ROS_INFO("[GPS] addGPSFactor: GNSS covariance too large, continue");
                     continue;}
             // GPS里程计位置
-            float gps_x = thisGPS.pose.pose.position.x;
-            float gps_y = thisGPS.pose.pose.position.y;
-            float gps_z = thisGPS.pose.pose.position.z;
+            // 获取当前位姿值
+            float current_pose_x = transformTobeMapped[3];  // 当前位姿 x
+            float current_pose_y = transformTobeMapped[4];  // 当前位姿 y
+            float current_pose_z = transformTobeMapped[5];  // 当前位姿 z
+            float current_pose_roll = transformTobeMapped[0];  // 当前位姿 roll
+            float current_pose_pitch = transformTobeMapped[1];  // 当前位姿 pitch
+            float current_pose_yaw = transformTobeMapped[2];  // 当前位姿 yaw
+            
+            // 从欧拉角计算当前旋转矩阵（世界系到当前IMU系的旋转）
+            // 注意：世界系(camera_init)在第一帧时与第一帧IMU系对齐
+            // 所以这个旋转矩阵表示：当前IMU系相对于第一帧IMU系的旋转
+            Eigen::Quaterniond current_rot_quat = EulerToQuat(current_pose_roll, current_pose_pitch, current_pose_yaw);
+            Eigen::Matrix3d current_rot_matrix = current_rot_quat.toRotationMatrix();
+            
+            // GPS坐标写成三维向量
+            Eigen::Vector3d gps_pos(thisGPS.pose.pose.position.x, 
+                                    thisGPS.pose.pose.position.y, 
+                                    thisGPS.pose.pose.position.z);
+            
+            // 计算新的GPS坐标：原GPS坐标 + 当前旋转矩阵 * IMU到GNSS的平移向量
+            Eigen::Vector3d gps_pos_corrected = gps_pos + current_rot_matrix * t_imu_gnss;
+            
+            float gps_x = gps_pos_corrected(0);
+            float gps_y = gps_pos_corrected(1);
+            float gps_z = gps_pos_corrected(2);
+            
             if (!useGpsElevation)           //  是否使用gps的高度
             {
                 gps_z = transformTobeMapped[5];
@@ -746,7 +1246,7 @@ void addGPSFactor()
             curGPSPoint.x = gps_x;
             curGPSPoint.y = gps_y;
             curGPSPoint.z = gps_z;
-            if (pointDistance(curGPSPoint, lastGPSPoint) < 5.0 && pointDistance(curGPSPoint, lastGPSPoint) > 6.0){
+            if (pointDistance(curGPSPoint, lastGPSPoint) < 5.0 && pointDistance(cloudKeyPoses3D->front(), cloudKeyPoses3D->back())  > 6.0){
                 // cout<<"33333333"<<endl;
                 ROS_INFO("[GPS] addGPSFactor: distance to last GPS < 5m, continue");
                 continue;
@@ -769,11 +1269,447 @@ void addGPSFactor()
     }
 }
 
+bool setFrame() {
+    double timeLaserInfoCur = lidar_start_time;
+    cout << "decQueue.size()" << decQueue.size() << endl;
+    const double TIMESTAMP_TOLERANCE = 0.001; // 时间戳匹配容差：0.001秒
+    
+    // 查找时间戳最接近当前雷达帧的检测数据
+    while (!decQueue.empty()) // 更新到最新的时间戳，或者更新为空
+    {
+        std_msgs::Float64MultiArray thisDec = decQueue.front();
+        // 如果检测时间戳比雷达时间戳早超过容差，跳过该检测数据
+        if (thisDec.data[0] - timeLaserInfoCur < (-1) * TIMESTAMP_TOLERANCE) {
+            ROS_WARN_STREAM("Skipping detection with timestamp " << std::fixed << std::setprecision(8) << thisDec.data[0] 
+                            << " (too early, current lidar: " << std::fixed << std::setprecision(8) << timeLaserInfoCur << ")");
+            decQueue.pop_front();
+            if (decQueue.empty()) break;
+            continue;
+        }
+        // 如果时间戳差距在容差范围内，使用该检测数据
+        if (abs(thisDec.data[0] - timeLaserInfoCur) < TIMESTAMP_TOLERANCE) {
+            // cout << "do not wait, detect3d has already come" << endl;
+            break;
+        }
+        // 如果检测时间戳比雷达时间戳晚超过容差，等待（不跳过，因为可能后续会有匹配的）
+        break;
+    }
+    while (decQueue.empty()) // 如果空的话就等待。
+    {
+        static int j = 0;
+        sleep(0.001);
+        j++;
+        if (j == 60) {
+            cout << "Waiting for test results more than " << j << "ms, no more waiting!" << endl;
+            LidarSLAMFrame frame;
+            frame.frame_id = flow;
+            frame.objects.clear();
+            frames.push_back(frame);
+            j = 0;
+            return false;
+        }
+    }
+    
+    // 检查是否有可用的检测数据
+    if (decQueue.empty()) {
+        ROS_WARN_STREAM("No detection data available for lidar timestamp " << timeLaserInfoCur);
+        LidarSLAMFrame frame;
+        frame.frame_id = flow;
+        frame.objects.clear();
+        frames.push_back(frame);
+        return false;
+    }
+    
+    // 等到了检测结果：
+    std_msgs::Float64MultiArray thisDec = decQueue.front();
+    
+    // 最终检查时间戳是否匹配（必须在0.001秒以内）
+    double timeDiff = abs(thisDec.data[0] - timeLaserInfoCur);
+    if (timeDiff >= TIMESTAMP_TOLERANCE) {
+        ROS_WARN_STREAM("Detection timestamp mismatch: detection=" << thisDec.data[0] 
+                        << ", lidar=" << timeLaserInfoCur 
+                        << ", diff=" << timeDiff << "s (threshold=" << TIMESTAMP_TOLERANCE << "s)");
+        // 时间戳不匹配，返回空帧
+        LidarSLAMFrame frame;
+        frame.frame_id = flow;
+        frame.objects.clear();
+        frames.push_back(frame);
+        // 如果检测数据太早，移除它；如果太晚，保留等待下一帧
+        if (thisDec.data[0] < timeLaserInfoCur) {
+            decQueue.pop_front();
+        }
+        return false;
+    }
+    
+    int ob_num = (thisDec.data.size() - 1) / 9;
+    
+    // 调试信息：打印数据大小和物体数量
+    ROS_INFO_STREAM("Matched detection: timestamp=" << thisDec.data[0] 
+                    << ", lidar=" << timeLaserInfoCur 
+                    << ", diff=" << timeDiff << "s, ob_num=" << ob_num);
+    if (ob_num > 0) {
+        ROS_INFO_STREAM("First object: type=" << thisDec.data[1] 
+                        << " x=" << thisDec.data[2] 
+                        << " y=" << thisDec.data[3]
+                        << " z=" << thisDec.data[4]
+                        << " score=" << thisDec.data[9]);
+    }
+    
+    if (abs(thisDec.data[0] - timeLaserInfoCur) < TIMESTAMP_TOLERANCE) {
+        LidarSLAMFrame frame;
+        frame.frame_id = flow;
+        vector<LidarSLAMObject> objects;
+        int filtered_by_type = 0;
+        int filtered_by_position = 0;
+        int filtered_by_score = 0;
+        
+        for (int i = 0; i < ob_num; i++) {
+            LidarSLAMObject ob;
+            ob.frame_id = flow;
+            ob.obj_status = 1;
+            ob.type = thisDec.data[1 + 9 * i];
+            ob.score = thisDec.data[9 + 9 * i];
+            if (ob.type != 0) {
+                filtered_by_type++;
+                continue;
+            }
+            Eigen::Vector3f local_xyz = Eigen::Vector3f(float(thisDec.data[2 + 9 * i]), float(thisDec.data[3 + 9 * i]), float(thisDec.data[4 + 9 * i]));
+
+            if (local_xyz[0] <= -30.0 || abs(local_xyz[1]) > 24.0) {
+                filtered_by_position++;
+                continue;
+            }
+            if (ob.score < Scorethre) {
+                filtered_by_score++;
+                continue;
+            }
+            Eigen::Vector3f measure_lwh = Eigen::Vector3f(float(thisDec.data[5 + 9 * i]), float(thisDec.data[6 + 9 * i]), float(thisDec.data[7 + 9 * i]));
+            Eigen::Vector3f rotation_zyx = Eigen::Vector3f(float(thisDec.data[8 + 9 * i]), 0.0, 0.0);
+            for (int i = 0; i < 3; i++) {
+                ob.local_xyz[i] = local_xyz[i];
+                ob.rotation_zyx[i] = rotation_zyx(i);
+                ob.measure_lwh[i] = measure_lwh(i);
+            }
+            // Eigen::Affine3f local_t = Eigen::Affine3f::Identity();
+            // local_t = pcl::getTransformation(local_xyz[0], local_xyz[1], local_xyz[2], 0, 0, rotation_zyx[0]);
+            // ob.pose_inimu[0] = local_t.rotation().eulerAngles(0, 1, 2)[0];
+            // ob.pose_inimu[1] = local_t.rotation().eulerAngles(0, 1, 2)[1];
+            // ob.pose_inimu[2] = local_t.rotation().eulerAngles(0, 1, 2)[2];
+            // ob.pose_inimu[3] = local_t.translation()[0];
+            // ob.pose_inimu[4] = local_t.translation()[1];
+            // ob.pose_inimu[5] = local_t.translation()[2];
+            // LiDAR系下的局部变换
+            Eigen::Affine3f local_t_lidar = pcl::getTransformation(local_xyz[0], local_xyz[1], local_xyz[2], 0, 0, rotation_zyx[0]);
+            // 将 LiDAR 系位姿转换到 IMU/Body 系： p_imu = R_li * p_lidar + t_li
+            Eigen::Matrix3f R_li = Lidar_R_wrt_IMU.cast<float>();            // 全局 LiDAR->IMU 旋转（double->float）
+            Eigen::Vector3f t_li = Lidar_T_wrt_IMU.cast<float>();            // 全局 LiDAR->IMU 平移（double->float）
+            Eigen::Matrix3f R_obj_imu = R_li * local_t_lidar.rotation();     // 目标在 IMU 系下的旋转
+            Eigen::Vector3f t_obj_imu = R_li * local_t_lidar.translation() + t_li; // 目标在 IMU 系下的平移
+            Eigen::Affine3f local_t_imu = Eigen::Affine3f::Identity();
+            local_t_imu.linear() = R_obj_imu;
+            local_t_imu.translation() = t_obj_imu;
+            // 填充到 ob.pose_inimu（IMU 系下）
+            ob.pose_inimu[0] = local_t_imu.rotation().eulerAngles(0, 1, 2)[0];
+            ob.pose_inimu[1] = local_t_imu.rotation().eulerAngles(0, 1, 2)[1];
+            ob.pose_inimu[2] = local_t_imu.rotation().eulerAngles(0, 1, 2)[2];
+            ob.pose_inimu[3] = local_t_imu.translation()[0];
+            ob.pose_inimu[4] = local_t_imu.translation()[1];
+            ob.pose_inimu[5] = local_t_imu.translation()[2];
+            objects.push_back(ob);
+        }
+        
+        // 打印过滤统计信息
+        ROS_INFO_STREAM("Filter stats - Total: " << ob_num 
+                        << ", Passed: " << objects.size()
+                        << ", Type filtered: " << filtered_by_type
+                        << ", Position filtered: " << filtered_by_position
+                        << ", Score filtered: " << filtered_by_score);
+        
+        frame.objects = objects;
+        frames.push_back(frame);
+        decQueue.pop_front();
+        return true;
+    }
+    else {
+        cout << "something wrong!!!" << endl;
+        return false;
+    }
+}
+
 void saveKeyFramesAndFactor()
 {
+    if (if_dynamic){
+        setFrame();//这一帧的object和flow
+        // 当前帧在 body/world 下的位姿
+        Eigen::Affine3f local_pose = pcl::getTransformation(
+            (float)transformTobeMapped[3], (float)transformTobeMapped[4], (float)transformTobeMapped[5],
+            (float)transformTobeMapped[0], (float)transformTobeMapped[1], (float)transformTobeMapped[2]);
+        // 使用上一帧的 last_pos/last_rot 计算帧间增量：odom_incre = last_pose^{-1} * local_pose
+        Eigen::Affine3f odom_incre = Eigen::Affine3f::Identity();
+        if (flow > 0) {
+            Eigen::Affine3f last_pose = pcl::getTransformation(
+                static_cast<float>(last_pos(0)), static_cast<float>(last_pos(1)), static_cast<float>(last_pos(2)),
+                static_cast<float>(last_rot(0)), static_cast<float>(last_rot(1)), static_cast<float>(last_rot(2)));
+            odom_incre = last_pose.inverse() * local_pose;
+        } else {
+            odom_incre = Eigen::Affine3f::Identity();
+        }
+         frames[flow].optimize_pose = local_pose;
+         
+          // 1. Calculate the initial value of the object's pose
+         for (int n = 0; n < frames[flow].objects.size(); n++) {
+            Eigen::Affine3f global_t = Eigen::Affine3f::Identity();
+            global_t = local_pose * trans2Affine3f(frames[flow].objects[n].pose_inimu);
+            Affine3ftovec6f(global_t, frames[flow].objects[n].optimize_t);
+         }
+            // 2. Start tracking
+            tracker.AssociateObjects(frames, flow, vel_threshold, dynamBoxBuf);
+
+            // 3. Add factors
+            // 3.1 Add LiDAR odometry factors
+            frames[flow].vertex_local_id = local_graph.key_id;
+            if (flow == 0) {
+                priorfactor_id[flow].push_back(local_graph.f_id);
+                priorfactor_egoP_id[flow].push_back(local_graph.f_id);
+                local_graph.AddRobustPriorFactor(frames[flow].vertex_local_id, Affine3f2Pose3(local_pose), egoP_egoP, rubostNum);
+                local_graph.key_id++;
+                local_graph.setinitialEstimate(frames[flow].vertex_local_id, Affine3f2Pose3(local_pose));
+            }
+            if (flow > 0) {
+                frames[flow].edge_local_id = local_graph.f_id;
+                // 使用基于 last_pos/last_rot 与 local_pose 计算得到的 odom_incre
+                local_graph.AddRobustBTW2factor(frames[flow - 1].vertex_local_id, frames[flow].vertex_local_id, Affine3f2Pose3(odom_incre), egoP_egoP, rubostNum);
+                local_graph.key_id++;
+                local_graph.setinitialEstimate(frames[flow].vertex_local_id, Affine3f2Pose3(local_pose));
+            }
+
+            // 3.2 Add object motion factors
+            for (int k = 0; k < frames[flow].objects.size(); k++) {
+                if (!frames[flow].objects[k].initialized) {
+                    continue;
+                }
+                else {
+                    int last_as_ob = frames[flow].objects[k].associated_object_last.second;
+                    if (frames[flow].objects[k].dynamic) {
+                        frames[flow].objects[k].vertex_id = local_graph.key_id;
+                        if (if_priorfactor)
+                            if (frames[flow - 1].objects[last_as_ob].flag1 == -1) {
+                                priorfactor_id[flow].push_back(local_graph.f_id);
+                                pair<int, int> p(local_graph.f_id, k);
+                                priorfactor_objP_id[flow].push_back(p);
+                                local_graph.AddRobustPriorFactor(frames[flow].objects[k].vertex_id, vec6ftoPose3(frames[flow].objects[k].optimize_t), egoP_objP, rubostNum);
+                            }
+                        frames[flow].objects[k].flag1 = 1;
+
+                        frames[flow].objects[k].edge_id_link_frame_pose = local_graph.f_id;
+                        local_graph.AddRobustBTW2factor(frames[flow].vertex_local_id, frames[flow].objects[k].vertex_id, trans2gtsamPose(frames[flow].objects[k].pose_inimu), egoP_objP, rubostNum);
+                        local_graph.setinitialEstimate(frames[flow].objects[k].vertex_id, vec6ftoPose3(frames[flow].objects[k].optimize_t));
+                        local_graph.key_id++;
+                    }
+                    else {
+                        if (frames[flow - 1].objects[last_as_ob].vertex_id == -1 ||
+                            (frames[flow - 1].objects[last_as_ob].vertex_id != -1 && frames[flow - 1].objects[last_as_ob].dynamic)) {
+                            frames[flow].objects[k].vertex_id = local_graph.key_id;
+                            if (if_priorfactor)
+                                if (frames[flow - 1].objects[last_as_ob].flag1 == -1) {
+                                    priorfactor_id[flow].push_back(local_graph.f_id);
+                                    pair<int, int> p(local_graph.f_id, k);
+                                    priorfactor_objP_id[flow].push_back(p);
+                                    local_graph.AddRobustPriorFactor(frames[flow].objects[k].vertex_id, vec6ftoPose3(frames[flow].objects[k].optimize_t), egoP_objP, rubostNum);
+                                }
+                            frames[flow].objects[k].flag1 = 1;
+                            frames[flow].objects[k].edge_id_link_frame_pose = local_graph.f_id;
+                            local_graph.AddRobustBTW2factor(frames[flow].vertex_local_id, frames[flow].objects[k].vertex_id, trans2gtsamPose(frames[flow].objects[k].pose_inimu), ego_stationObjP, rubostNum);
+                            local_graph.setinitialEstimate(frames[flow].objects[k].vertex_id, vec6ftoPose3(frames[flow].objects[k].optimize_t));
+                            local_graph.key_id++;
+                        }
+                        else {
+                            frames[flow].objects[k].vertex_id = frames[flow - 1].objects[last_as_ob].vertex_id;
+                            frames[flow].objects[k].edge_id_link_frame_pose = local_graph.f_id;
+                            local_graph.AddRobustBTW2factor(frames[flow].vertex_local_id, frames[flow].objects[k].vertex_id, trans2gtsamPose(frames[flow].objects[k].pose_inimu), ego_stationObjP, rubostNum);
+                        }
+                    }
+
+                    // 3.3 Add object motion factors
+                    if (frames[flow - 1].objects[last_as_ob].vertex_id != -1 &&
+                        (frames[flow].objects[k].dynamic ||
+                            (!frames[flow].objects[k].dynamic && frames[flow - 1].objects[last_as_ob].dynamic))) {
+                        Eigen::Affine3f last_ob_t = gtsamPose3toAffine3f(vec6ftoPose3(frames[flow - 1].objects[last_as_ob].optimize_t));
+                        Eigen::Affine3f change = last_ob_t.inverse() * gtsamPose3toAffine3f(vec6ftoPose3(frames[flow].objects[k].optimize_t));
+                        frames[flow].objects[k].vertex_id_pose_change = local_graph.key_id;
+                        if (if_priorfactor)
+                            if (frames[flow - 1].objects[last_as_ob].flag2 == -1) {
+                                priorfactor_id[flow - 1].push_back(local_graph.f_id);
+                                local_graph.AddRobustPriorFactor(frames[flow].objects[k].vertex_id_pose_change, Affine3f2Pose3(change), objP_objP_chgP, rubostNum);
+                            }
+                        frames[flow].objects[k].flag2 == 1;
+                        frames[flow].objects[k].edge_id_link_2object_with_pose_change = local_graph.f_id;
+
+                        local_graph.AddRobustBTW3factor(frames[flow - 1].objects[last_as_ob].vertex_id, frames[flow].objects[k].vertex_id, frames[flow].objects[k].vertex_id_pose_change, objP_objP_chgP, rubostNum);
+                        local_graph.key_id++;
+
+                        local_graph.setinitialEstimate(frames[flow].objects[k].vertex_id_pose_change, Affine3f2Pose3(change));
+                        // 3.4 Add smooth motion factors
+                        if (frames[flow - 1].objects[last_as_ob].vertex_id_pose_change != -1) {
+                            frames[flow].objects[k].edge_id_link_2pose_change = local_graph.f_id;
+                            local_graph.AddRobustBTW2factor(frames[flow - 1].objects[last_as_ob].vertex_id_pose_change,
+                                frames[flow].objects[k].vertex_id_pose_change, Affine3f2Pose3(Eigen::Affine3f::Identity()), chgP_chgP, rubostNum);
+                        }
+                    }
+                }
+            }
+
+            // 4. Sliding window, remove old factors
+            if (flow >= window_size) {
+                gtsam::Marginals marginals(graph_temp, local_graph.result);
+                int margin_frame = flow - window_size;
+
+                for (auto it = priorfactor_id[margin_frame].begin(); it != priorfactor_id[margin_frame].end(); it++) {
+                    local_graph.Removefactor(*it);
+                }
+
+                local_graph.Removefactor(frames[margin_frame + 1].edge_local_id);
+                local_graph.Removekey(frames[margin_frame].vertex_local_id);
+                priorfactor_id[margin_frame + 1].push_back(local_graph.f_id);
+                priorfactor_egoP_id[margin_frame + 1].push_back(local_graph.f_id);
+
+                local_graph.AddRobustMarginalPrior(frames[margin_frame + 1].vertex_local_id, local_graph.result.at<gtsam::Pose3>(frames[margin_frame + 1].vertex_local_id), marginals, rubostNum);
+
+                for (int k = 0; k < frames[margin_frame].objects.size(); k++) {
+                    int last_as_ob = frames[margin_frame].objects[k].associated_object_last.second;
+                    int next_as_ob = frames[margin_frame].objects[k].associated_object_next.second;
+                    if (frames[margin_frame].objects[k].vertex_id != -1) {
+                        if (frames[margin_frame].objects[k].dynamic) {
+                            local_graph.Removefactor(frames[margin_frame].objects[k].edge_id_link_frame_pose);
+                            local_graph.Removekey(frames[margin_frame].objects[k].vertex_id);
+                            if (next_as_ob == -1) {
+                                continue;
+                            }
+                            if (if_priorfactor && frames[margin_frame + 1].objects[next_as_ob].vertex_id != -1) {
+                                priorfactor_id[margin_frame + 1].push_back(local_graph.f_id);
+                                pair<int, int> p(local_graph.f_id, next_as_ob);
+                                priorfactor_objP_id[margin_frame + 1].push_back(p);
+                                local_graph.AddRobustMarginalPrior(frames[margin_frame + 1].objects[next_as_ob].vertex_id, local_graph.result.at<gtsam::Pose3>(frames[margin_frame + 1].objects[next_as_ob].vertex_id), marginals, rubostNum);
+                            }
+
+                            if (frames[margin_frame + 1].objects[next_as_ob].vertex_id_pose_change != -1) {
+                                local_graph.Removefactor(frames[margin_frame + 1].objects[next_as_ob].edge_id_link_2object_with_pose_change);
+                                local_graph.Removekey(frames[margin_frame + 1].objects[next_as_ob].vertex_id_pose_change);
+                                int n_next_ob = frames[margin_frame + 1].objects[next_as_ob].associated_object_next.second;
+                                if (n_next_ob != -1)
+                                    if (frames[margin_frame + 2].objects[n_next_ob].vertex_id_pose_change != -1) {
+                                        if (if_priorfactor) {
+                                            priorfactor_id[margin_frame + 1].push_back(local_graph.f_id);
+                                            local_graph.AddRobustMarginalPrior(frames[margin_frame + 2].objects[n_next_ob].vertex_id_pose_change, local_graph.result.at<gtsam::Pose3>(frames[margin_frame + 2].objects[n_next_ob].vertex_id_pose_change), marginals, rubostNum);
+                                        }
+                                        if (frames[margin_frame + 2].objects[n_next_ob].edge_id_link_2pose_change != -1)
+                                            local_graph.Removefactor(frames[margin_frame + 2].objects[n_next_ob].edge_id_link_2pose_change);
+                                    }
+                            }
+                        }
+                        else {
+                            local_graph.Removefactor(frames[margin_frame].objects[k].edge_id_link_frame_pose);
+                            if (next_as_ob == -1 || (next_as_ob != -1 && frames[margin_frame + 1].objects[next_as_ob].dynamic)) {
+                                local_graph.Removekey(frames[margin_frame].objects[k].vertex_id);
+                            }
+                            if (next_as_ob == -1)
+                                continue;
+                            if (if_priorfactor && frames[margin_frame + 1].objects[next_as_ob].vertex_id != -1) {
+                                priorfactor_id[margin_frame + 1].push_back(local_graph.f_id);
+                                pair<int, int> p(local_graph.f_id, next_as_ob);
+                                priorfactor_objP_id[margin_frame + 1].push_back(p);
+                                local_graph.AddRobustMarginalPrior(frames[margin_frame + 1].objects[next_as_ob].vertex_id, local_graph.result.at<gtsam::Pose3>(frames[margin_frame + 1].objects[next_as_ob].vertex_id), marginals, rubostNum);
+                            }
+                            if (frames[margin_frame + 1].objects[next_as_ob].vertex_id_pose_change != -1) {
+                                local_graph.Removefactor(frames[margin_frame + 1].objects[next_as_ob].edge_id_link_2object_with_pose_change);
+                                local_graph.Removekey(frames[margin_frame + 1].objects[next_as_ob].vertex_id_pose_change);
+                                int n_next_ob = frames[margin_frame + 1].objects[next_as_ob].associated_object_next.second;
+                                if (n_next_ob != -1)
+                                    if (frames[margin_frame + 2].objects[n_next_ob].vertex_id_pose_change != -1) {
+                                        if (if_priorfactor) {
+                                            priorfactor_id[margin_frame + 1].push_back(local_graph.f_id);
+                                            local_graph.AddRobustMarginalPrior(frames[margin_frame + 2].objects[n_next_ob].vertex_id_pose_change, local_graph.result.at<gtsam::Pose3>(frames[margin_frame + 2].objects[n_next_ob].vertex_id_pose_change), marginals, rubostNum);
+                                        }
+                                        if (frames[margin_frame + 2].objects[n_next_ob].edge_id_link_2pose_change != -1)
+                                            local_graph.Removefactor(frames[margin_frame + 2].objects[n_next_ob].edge_id_link_2pose_change);
+                                    }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 5. Start optimization and updated results 
+            cout << "Start optimize!   non-null factors size: " << local_graph.gtSAMgraph2.nrFactors();
+            auto Time0 = std::chrono::steady_clock::now();
+            local_graph.StartOptimiz(local_graph.gtSAMgraph2.nrFactors());
+            auto Time1 = std::chrono::steady_clock::now();
+            cout << "Optimize end! opt time = " << std::chrono::duration<double>(Time1 - Time0).count() * 1000 << " ms" << endl;
+
+            gtsam::Pose3 this_pose = local_graph.result.at<gtsam::Pose3>(frames[flow].vertex_local_id);
+            frames[flow].optimize_pose = gtsamPose3toAffine3f(local_graph.result.at<gtsam::Pose3>(frames[flow].vertex_local_id));
+            for (int k = 0; k < frames[flow].objects.size(); k++) {
+                if (frames[flow].objects[k].vertex_id != -1) {
+                    Pose3tovec6f(local_graph.result.at<gtsam::Pose3>(frames[flow].objects[k].vertex_id), frames[flow].objects[k].optimize_t);
+                    Eigen::Affine3f local_t = frames[flow].optimize_pose.inverse() * gtsamPose3toAffine3f(local_graph.result.at<gtsam::Pose3>(frames[flow].objects[k].vertex_id));
+                    for (int i = 0; i < 3; i++) {
+                        frames[flow].objects[k].local_xyz[i] = local_t.translation()[i];
+                    }
+                    tracker.Update_TrackUtmXY(frames[flow].objects[k].object_id, frames[flow].objects[k].optimize_t[3], frames[flow].objects[k].optimize_t[4]);
+                    if (frames[flow].objects[k].vertex_id_pose_change != -1) {
+                        Pose3tovec6f(local_graph.result.at<gtsam::Pose3>(frames[flow].objects[k].vertex_id_pose_change), frames[flow].objects[k].v_t);
+                        std::vector<float> v_t = frames[flow].objects[k].v_t;
+                        double dd = sqrt(v_t[3] * v_t[3] + v_t[4] * v_t[4] + v_t[5] * v_t[5]);
+                        frames[flow].objects[k].velocity = dd / 0.1 * 3.6;
+                    }
+                }
+            }
+
+            // 局部因子图优化后，不更新自身姿态，保持原来的transformTobeMapped
+            // transformTobeMapped[0] = this_pose.rotation().roll();
+            // transformTobeMapped[1] = this_pose.rotation().pitch();
+            // transformTobeMapped[2] = this_pose.rotation().yaw();
+            // transformTobeMapped[3] = this_pose.x();
+            // transformTobeMapped[4] = this_pose.y();
+            // transformTobeMapped[5] = this_pose.z();
+
+
+            graph_temp = local_graph.gtSAMgraph2;
+
+
+
+        
+
+    }
     //  计算当前帧与前一帧位姿变换，如果变化太小，不设为关键帧，反之设为关键帧
-    if (saveFrame() == false)
+    if (saveFrame() == false){
+       
+
+        // 局部因子图优化后，不更新自身姿态，保持原来的ESKF状态
+        // if (if_dynamic){
+        //     //修改ESKF状态为当前局部因子图优化后的结果
+        //     state_ikfom state_updated = kf.get_x(); //  获取cur_pose (还没修正)
+        //     Eigen::Vector3d pos(transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5]);
+        //     Eigen::Quaterniond q = EulerToQuat(transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]);
+
+        // //  更新状态量
+        //     state_updated.pos = pos;
+        //     state_updated.rot =  q;
+        //     state_point = state_updated; // 对state_point进行更新，state_point可视化用到
+        // // if(aLoopIsClosed == true )
+        //     kf.change_x(state_updated);  //  对cur_pose 进行isam2优化后的修正 
+        // }
+
+         // 保存当前帧的平移和旋转到last_pose
+        state_ikfom state_now = kf.get_x();
+        last_pos = state_now.pos.cast<double>();
+        Eigen::Vector3d rot_ang = state_now.rot.toRotationMatrix().eulerAngles(2,1,0); 
+        last_rot(0) = rot_ang(2);//roll
+        last_rot(1) = rot_ang(1);//pitch
+        last_rot(2) = rot_ang(0);//yaw
+        flow++;
         return;
+    }
     // 激光里程计因子(from fast-lio),  输入的是frame_relative pose  帧间位姿(body 系下)
     addOdomFactor();
     // GPS因子 (UTM -> WGS84)
@@ -840,6 +1776,30 @@ void saveKeyFramesAndFactor()
     // if(aLoopIsClosed == true )
     kf.change_x(state_updated);  //  对cur_pose 进行isam2优化后的修正
 
+    //保存这次的结果到last_pos,last_rot
+    state_ikfom state_now = kf.get_x();
+    last_pos = state_now.pos.cast<double>();
+    Eigen::Vector3d rot_ang = state_now.rot.toRotationMatrix().eulerAngles(2,1,0); 
+    last_rot(0) = rot_ang(2);//roll
+    last_rot(1) = rot_ang(1);//pitch
+    last_rot(2) = rot_ang(0);//yaw
+    
+    // 全局优化之后，把当前帧位姿的结果作为一个强的观测节点加入localgraph中
+    if (if_dynamic && flow < frames.size() && frames[flow].vertex_local_id != -1) {
+        // 使用全局优化后的协方差创建噪声模型
+        gtsam::noiseModel::Base::shared_ptr robustGlobalPoseNoise;
+        robustGlobalPoseNoise = gtsam::noiseModel::Robust::Create(
+            gtsam::noiseModel::mEstimator::Cauchy::Create(rubostNum),
+            gtsam::noiseModel::Gaussian::Covariance(poseCovariance));
+        
+        // 添加先验因子到localgraph
+        priorfactor_id[flow].push_back(local_graph.f_id);
+        priorfactor_egoP_id[flow].push_back(local_graph.f_id);
+        local_graph.gtSAMgraph2.add(gtsam::PriorFactor<gtsam::Pose3>(
+            frames[flow].vertex_local_id, latestEstimate, robustGlobalPoseNoise));
+        local_graph.f_id++;
+    }
+     
     // TODO:  P的修正有待考察，按照yanliangwang的做法，修改了p，会跑飞
     // esekfom::esekf<state_ikfom, 12, input_ikfom>::cov P_updated = kf.get_P(); // 获取当前的状态估计的协方差矩阵
     // P_updated.setIdentity();
@@ -854,13 +1814,19 @@ void saveKeyFramesAndFactor()
     // pcl::PointCloud<PointType>::Ptr thisCornerKeyFrame(new pcl::PointCloud<PointType>());
     pcl::PointCloud<PointType>::Ptr thisSurfKeyFrame(new pcl::PointCloud<PointType>());
     // pcl::copyPointCloud(*feats_undistort,  *thisCornerKeyFrame);
-    pcl::copyPointCloud(*feats_undistort, *thisSurfKeyFrame); // 存储关键帧,没有降采样的点云
+    // 根据dense_keyframe参数选择存储的点云类型
+    if (dense_keyframe) {
+        pcl::copyPointCloud(*feats_undistort, *thisSurfKeyFrame); // 存储关键帧,去畸变后的完整点云
+    } else {
+        pcl::copyPointCloud(*feats_down_body, *thisSurfKeyFrame); // 存储关键帧,降采样后的点云
+    }
 
     // 保存特征点降采样集合
     // cornerCloudKeyFrames.push_back(thisCornerKeyFrame);
     surfCloudKeyFrames.push_back(thisSurfKeyFrame);
 
     updatePath(thisPose6D); //  可视化update后的path
+    flow++;
 }
 
 void reconstructIKdTree(int construct_mode){
@@ -975,6 +1941,7 @@ void reconstructIKdTree(int construct_mode){
 
         ROS_INFO("[TIME][reconstructIKdTree] search=%.3f ms, ds_pose=%.3f ms, collect=%.3f ms, ds_map=%.3f ms, rebuild=%.3f ms, total=%.3f ms",
                  search_ms, ds_pose_ms, collect_ms, ds_map_ms, rebuild_ms, recon_ms);
+
     }
         updateKdtreeCount ++ ; 
 }
@@ -1104,7 +2071,6 @@ void performLoopClosure()
 {
     ros::Time timeLaserInfoStamp = ros::Time().fromSec(lidar_end_time); //  时间戳
     string odometryFrame = "camera_init";
-
     if (cloudKeyPoses3D->points.empty() == true)
     {
         return;
@@ -1182,7 +2148,9 @@ void performLoopClosure()
     // 闭环匹配帧的位姿
     gtsam::Pose3 poseTo = pclPointTogtsamPose3(copy_cloudKeyPoses6D->points[loopKeyPre]);
     gtsam::Vector Vector6(6);
-    float noiseScore = icp.getFitnessScore() ; //  loop_clousre  noise from icp
+    // float noiseScore = icp.getFitnessScore() ; 
+    float noiseScore = loopClosureNoiseScore; //  loop_clousre  noise from config
+    
     Vector6 << noiseScore, noiseScore, noiseScore, noiseScore, noiseScore, noiseScore;
     gtsam::noiseModel::Diagonal::shared_ptr constraintNoise = gtsam::noiseModel::Diagonal::Variances(Vector6);
     std::cout << "loopNoiseQueue   =   " << noiseScore << std::endl;
@@ -1196,6 +2164,213 @@ void performLoopClosure()
 
     loopIndexContainer[loopKeyCur] = loopKeyPre; //   使用hash map 存储回环对
 }
+
+void loadDetectionsFromFile(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "[ERROR] Failed to open detection file: " << filename << std::endl;
+        ROS_ERROR_STREAM("Failed to open detection file: " << filename);
+        return;
+    }
+    
+    // 先统计文件总行数用于显示进度
+    std::cout << "[INFO] Counting total lines in file: " << filename << std::endl;
+    std::cout.flush();
+    int totalLines = 0;
+    std::string tempLine;
+    std::streampos filePos = file.tellg();
+    while (std::getline(file, tempLine)) {
+        // 跳过空行和注释行（以#开头）
+        if (tempLine.empty() || tempLine.find_first_not_of(" \t\n\r") == std::string::npos) {
+            continue;
+        }
+        // 跳过注释行
+        std::string trimmed = tempLine;
+        trimmed.erase(0, trimmed.find_first_not_of(" \t")); // 去除前导空白
+        if (trimmed.empty() || trimmed[0] == '#') {
+            continue;
+        }
+        totalLines++;
+    }
+    file.clear(); // 清除EOF标志
+    file.seekg(0, std::ios::beg); // 重置文件指针到开头
+    std::cout << "[INFO] Total lines to process: " << totalLines << std::endl;
+    std::cout.flush();
+    
+    std::string line;
+    int count = 0;
+    int skipped = 0;
+    int processedLines = 0;
+    int lastProgressPercent = -1;
+    
+    std::cout << "[INFO] Loading detection data from file: " << filename << std::endl;
+    std::cout.flush();
+    ROS_INFO_STREAM("Loading detection data from file: " << filename);
+    
+    while (std::getline(file, line)) {
+        // 跳过空行
+        if (line.empty() || line.find_first_not_of(" \t\n\r") == std::string::npos) {
+            continue;
+        }
+        
+        // 跳过注释行（以#开头）
+        std::string trimmed = line;
+        trimmed.erase(0, trimmed.find_first_not_of(" \t")); // 去除前导空白
+        if (trimmed.empty() || trimmed[0] == '#') {
+            continue;
+        }
+        
+        processedLines++;
+        
+        // 显示进度（每10%或每1000行）
+        if (totalLines > 0) {
+            int currentPercent = (processedLines * 100) / totalLines;
+            if (currentPercent != lastProgressPercent && (currentPercent % 10 == 0 || processedLines % 1000 == 0)) {
+                std::cout << "[INFO] Loading progress: " << currentPercent << "% (" 
+                         << processedLines << "/" << totalLines << " lines, "
+                         << count << " valid frames loaded)" << std::endl;
+                std::cout.flush();
+                lastProgressPercent = currentPercent;
+            }
+        } else if (processedLines % 1000 == 0) {
+            std::cout << "[INFO] Loading progress: " << processedLines << " lines processed, "
+                     << count << " valid frames loaded" << std::endl;
+            std::cout.flush();
+        }
+        
+        // 移除方括号和多余字符
+        line.erase(std::remove(line.begin(), line.end(), '['), line.end());
+        line.erase(std::remove(line.begin(), line.end(), ']'), line.end());
+        
+        // 将逗号替换为空格
+        std::replace(line.begin(), line.end(), ',', ' ');
+        
+        std::istringstream iss(line);
+        std_msgs::Float64MultiArray detectMsg;
+        double value;
+        
+        // 读取该行的所有数值
+        while (iss >> value) {
+            detectMsg.data.push_back(value);
+        }
+        
+        // 确保数据格式正确：至少有时间戳，且后续数据是9的倍数
+        if (detectMsg.data.size() >= 1 && (detectMsg.data.size() - 1) % 9 == 0) {
+            std::lock_guard<std::mutex> lock(decLock);
+            decQueue.push_back(detectMsg);
+            count++;
+        } else {
+            std::cerr << "[WARN] Skipped malformed line (line number: " << processedLines 
+                     << "), data length: " << detectMsg.data.size() << std::endl;
+            skipped++;
+        }
+    }
+    
+    file.close();
+    std::cout << "[INFO] Loading complete! Successfully loaded " << count << " frames of detection data (skipped " << skipped << " lines)" << std::endl;
+    std::cout << "[INFO] decQueue size: " << decQueue.size() << std::endl;
+    std::cout.flush();
+    ROS_INFO_STREAM("Successfully loaded " << count << " frames of detection data (skipped " << skipped << " lines)");
+    ROS_INFO_STREAM("decQueue size: " << decQueue.size());
+}
+
+
+void performSCLoopClosure() {
+    ros::Time timeLaserInfoStamp = ros::Time().fromSec(lidar_end_time); //  时间戳
+    string odometryFrame = "camera_init";
+    if (cloudKeyPoses3D->points.empty() == true)
+        return;
+
+    // find keys
+    auto detectResult = scManager.detectLoopClosureID(); // first: nn index, second: yaw diff
+    int loopKeyCur = copy_cloudKeyPoses3D->size() - 1;
+    int loopKeyPre = detectResult.first;
+    float yawDiffRad = detectResult.second; // not use for v1 (because pcl icp withi initial somthing wrong...)
+    if (loopKeyPre == -1 /* No loop found */)
+        return;
+
+    std::cout << "SC loop found! between " << loopKeyCur << " and " << loopKeyPre << "." << std::endl; // giseop
+
+    // extract cloud
+    pcl::PointCloud<PointType>::Ptr cureKeyframeCloud(new pcl::PointCloud<PointType>());
+    pcl::PointCloud<PointType>::Ptr prevKeyframeCloud(new pcl::PointCloud<PointType>());
+    {
+        // loopFindNearKeyframesWithRespectTo(cureKeyframeCloud, loopKeyCur, 0, loopKeyPre); // giseop
+        // loopFindNearKeyframes(prevKeyframeCloud, loopKeyPre, historyKeyframeSearchNum);
+
+        int base_key = 0;
+        loopFindNearKeyframes(cureKeyframeCloud, loopKeyCur, 0);
+        loopFindNearKeyframes(prevKeyframeCloud, loopKeyPre, historyKeyframeSearchNum);
+        if (cureKeyframeCloud->size() < 300 || prevKeyframeCloud->size() < 1000)
+            return;
+        if (pubHistoryKeyFrames.getNumSubscribers() != 0)
+            publishCloud(&pubHistoryKeyFrames, prevKeyframeCloud, timeLaserInfoStamp, odometryFrame);
+    }
+
+    // ICP Settings
+    static pcl::IterativeClosestPoint<PointType, PointType> icp;
+    icp.setMaxCorrespondenceDistance(150); // giseop , use a value can cover 2*historyKeyframeSearchNum range in meter
+    icp.setMaximumIterations(100);
+    icp.setTransformationEpsilon(1e-6);
+    icp.setEuclideanFitnessEpsilon(1e-6);
+    icp.setRANSACIterations(0);
+
+    // Align clouds
+    icp.setInputSource(cureKeyframeCloud);
+    icp.setInputTarget(prevKeyframeCloud);
+    pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
+    icp.align(*unused_result);
+
+    if (icp.hasConverged() == false || icp.getFitnessScore() > historyKeyframeFitnessScore) {
+        std::cout << "ICP fitness test failed (" << icp.getFitnessScore() << " > " << historyKeyframeFitnessScore << "). Reject this SC loop." << std::endl;
+        return;
+    }
+    else {
+        std::cout << "ICP fitness test passed (" << icp.getFitnessScore() << " < " << historyKeyframeFitnessScore << "). Add this SC loop." << std::endl;
+    }
+
+    // publish corrected cloud
+    if (pubIcpKeyFrames.getNumSubscribers() != 0) {
+        pcl::PointCloud<PointType>::Ptr closed_cloud(new pcl::PointCloud<PointType>());
+        pcl::transformPointCloud(*cureKeyframeCloud, *closed_cloud, icp.getFinalTransformation());
+        publishCloud(&pubIcpKeyFrames, closed_cloud, timeLaserInfoStamp, odometryFrame);
+    }
+
+    // Get pose transformation
+    float x, y, z, roll, pitch, yaw;
+    Eigen::Affine3f correctionLidarFrame;
+    correctionLidarFrame = icp.getFinalTransformation();
+
+    // transform from world origin to wrong pose
+    Eigen::Affine3f tWrong = pclPointToAffine3f(copy_cloudKeyPoses6D->points[loopKeyCur]);
+    // transform from world origin to corrected pose
+    Eigen::Affine3f tCorrect = correctionLidarFrame * tWrong; // pre-multiplying -> successive rotation about a fixed frame
+    pcl::getTranslationAndEulerAngles(tCorrect, x, y, z, roll, pitch, yaw);
+    gtsam::Pose3 poseFrom = gtsam::Pose3(gtsam::Rot3::RzRyRx(roll, pitch, yaw), gtsam::Point3(x, y, z));
+    gtsam::Pose3 poseTo = pclPointTogtsamPose3(copy_cloudKeyPoses6D->points[loopKeyPre]);
+
+
+    // giseop, robust kernel for a SC loop
+    float robustNoiseScore = 0.5; // constant is ok...
+    gtsam::Vector robustNoiseVector6(6);
+    robustNoiseVector6 << robustNoiseScore, robustNoiseScore, robustNoiseScore, robustNoiseScore, robustNoiseScore, robustNoiseScore;
+    gtsam::noiseModel::Base::shared_ptr robustConstraintNoise;
+    robustConstraintNoise = gtsam::noiseModel::Robust::Create(
+        gtsam::noiseModel::mEstimator::Cauchy::Create(1), // optional: replacing Cauchy by DCS or GemanMcClure, but with a good front-end loop detector, Cauchy is empirically enough.
+        gtsam::noiseModel::Diagonal::Variances(robustNoiseVector6)); // - checked it works. but with robust kernel, map modification may be delayed (i.e,. requires more true-positive loop factors)
+
+    // Add pose constraint
+    mtx.lock();
+    loopIndexQueue.push_back(std::make_pair(loopKeyCur, loopKeyPre));
+    loopPoseQueue.push_back(poseFrom.between(poseTo));
+    loopNoiseQueue.push_back(robustConstraintNoise);
+    mtx.unlock();
+
+    // add loop constriant
+    // loopIndexContainer[loopKeyCur] = loopKeyPre;
+    loopIndexContainer.insert(std::pair<int, int>(loopKeyCur, loopKeyPre)); // giseop for multimap
+} // performSCLoopClosure
+
 
 //回环检测线程
 void loopClosureThread()
@@ -1211,6 +2386,7 @@ void loopClosureThread()
     {
         rate.sleep();
         performLoopClosure();   //  回环检测
+        // performSCLoopClosure(); //  基于scan context的回环检测
         visualizeLoopClosure(); // rviz展示闭环边
     }
 }
@@ -1227,7 +2403,7 @@ inline void dump_lio_state_to_log(FILE *fp)
     // TUM format: timestamp x y z qx qy qz qw
     const auto &p = odomAftMapped.pose.pose.position;
     const auto &q = odomAftMapped.pose.pose.orientation;
-    double t = Measures.lidar_beg_time; // or lidar_end_time
+    double t = lidar_end_time; // or lidar_end_time
     fprintf(fp, "%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
             t, p.x, p.y, p.z, q.x, q.y, q.z, q.w);
     fflush(fp);
@@ -1379,6 +2555,12 @@ void lasermap_fov_segment()
     kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
+void DetectHandler(const std_msgs::Float64MultiArray::ConstPtr& detectMsg) {
+    std::lock_guard<std::mutex> lock(decLock);
+    decQueue.push_back(*detectMsg);
+}
+
+
 void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
 {
     mtx_buffer.lock();
@@ -1526,9 +2708,11 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
                         << " yaw="   << euler_zyx[0]
                         << " pitch=" << euler_zyx[1]
                         << " roll="  << euler_zyx[2]); 
+        // 保存第一帧的IMU旋转（位置在第一次计算gnss_pose时保存）
+        first_gnss_imu_rot = q_imu;
         gnss_inited = true ;
     }else{
-        if (gnss_data.status != 0)
+        if (gnss_data.status < 0)
             return;                               //   初始化完成
         gnss_data.UpdateXYZ(msg_in->latitude, msg_in->longitude, msg_in->altitude) ;             //  WGS84 -> ENU  ???  调试结果好像是 NED 北东地
 
@@ -1540,7 +2724,7 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
         // Eigen::Isometry3d gnss_to_lidar(Gnss_R_wrt_Lidar) ;
         // gnss_to_lidar.pretranslate(Gnss_T_wrt_Lidar);
         // gnss_pose  =  gnss_to_lidar  *  gnss_pose ;                    //  gnss 转到 lidar 系下, （当前Gnss_T_wrt_Lidar，只是一个大致的初值）
-        gnss_pose  =  R_world_imu.transpose()*gnss_pose ;        //  东北天系 转到 世界imu 系
+        gnss_pose  =  R_world_imu.transpose()*gnss_pose-t_imu_gnss ;        //  东北天系 转到 世界imu 系
         // cout<<" gnss_pose  = \n"<< gnss_pose <<endl;
         nav_msgs::Odometry gnss_data_enu ;
         // add new message to buffer:
@@ -1568,6 +2752,67 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
         msg_gnss_pose.pose.position.y = gnss_pose(1) ;
         msg_gnss_pose.pose.position.z = gnss_pose(2) ;
         // cout<<" gnss_data.pose.pose.position.x  = "<< gnss_data_enu.pose.pose.position.x  <<endl;
+
+        // 获取与GNSS时间最接近的IMU姿态
+        sensor_msgs::Imu::ConstPtr closest_imu;
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer);
+            double min_time_diff = std::numeric_limits<double>::max();
+            for (const auto &imu_msg : imu_buffer) {
+                double t_imu = imu_msg->header.stamp.toSec();
+                double time_diff = std::abs(t_imu - timestamp);
+                if (time_diff < min_time_diff) {
+                    min_time_diff = time_diff;
+                    closest_imu = imu_msg;
+                }
+            }
+        }
+
+        Eigen::Quaterniond current_gnss_imu_rot;
+        if (closest_imu) {
+            const auto &q = closest_imu->orientation;
+            current_gnss_imu_rot = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
+        } else {
+            // 如果没有找到IMU，使用geoQuat（可能不是最新的）
+            current_gnss_imu_rot = Eigen::Quaterniond(geoQuat.w, geoQuat.x, geoQuat.y, geoQuat.z);
+        }
+
+        // gnss_pose已经是相对于初始IMU的位置，直接使用
+        // 计算当前IMU旋转相对于初始IMU旋转的变换
+        Eigen::Quaterniond relative_rot;
+        if (closest_imu) {
+            relative_rot = first_gnss_imu_rot.inverse() * current_gnss_imu_rot;
+        } else {
+            // 如果没有找到IMU，使用geoQuat并计算相对旋转
+            Eigen::Quaterniond current_geo_rot(geoQuat.w, geoQuat.x, geoQuat.y, geoQuat.z);
+            relative_rot = current_geo_rot;
+        }
+
+        // 以TUM格式写入txt文件：timestamp x y z qx qy qz qw
+        // 位置直接使用gnss_pose（已经是相对于初始IMU的位置）
+        static FILE *fp_gnss_pose_gt = nullptr;
+        static bool gnss_pose_gt_file_inited = false;
+        
+        if (!gnss_pose_gt_file_inited) {
+            string gnss_pose_gt_dir = root_dir + "/Log";
+            boost::filesystem::create_directories(gnss_pose_gt_dir);
+            string gnss_pose_gt_path = gnss_pose_gt_dir + "/mypose_gt.txt";
+            fp_gnss_pose_gt = fopen(gnss_pose_gt_path.c_str(), "w");
+            if (!fp_gnss_pose_gt) {
+                ROS_ERROR("Failed to open GNSS pose GT file: %s", gnss_pose_gt_path.c_str());
+            } else {
+                gnss_pose_gt_file_inited = true;
+                ROS_INFO("Opened GNSS pose GT file: %s", gnss_pose_gt_path.c_str());
+            }
+        }
+        
+        if (fp_gnss_pose_gt) {
+            fprintf(fp_gnss_pose_gt, "%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                    gnss_data.time,
+                    gnss_pose.x(), gnss_pose.y(), gnss_pose.z(),
+                    relative_rot.x(), relative_rot.y(), relative_rot.z(), relative_rot.w());
+            fflush(fp_gnss_pose_gt);
+        }
 
         gps_path.poses.push_back(msg_gnss_pose);
 
@@ -1602,10 +2847,11 @@ bool sync_packages(MeasureGroup &meas)
     {
         meas.lidar = lidar_buffer.front();         // lidar指针指向最旧的lidar数据
         meas.lidar_beg_time = time_buffer.front(); //记录最早时间
-
+        lidar_start_time = meas.lidar_beg_time;
         //更新结束时刻的时间
         if (meas.lidar->points.size() <= 1) // time too little 时间太短，点数不足
-        {
+        {   
+            lidar_start_time = meas.lidar_beg_time;
             lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime; // 记录lidar结束时间为 起始时间 + 单帧扫描时间
             ROS_WARN("Too few input point cloud!\n");
         }
@@ -1814,12 +3060,12 @@ void set_posestamp(T &out)
     out.pose.position.x = state_point.pos(0);
     out.pose.position.y = state_point.pos(1);
     out.pose.position.z = state_point.pos(2);
-    out.pose.orientation.x = geoQuat.x;
-    out.pose.orientation.y = geoQuat.y;
-    out.pose.orientation.z = geoQuat.z;
-    out.pose.orientation.w = geoQuat.w;
+    out.pose.orientation.x = state_point.rot.coeffs()[0];
+    out.pose.orientation.y = state_point.rot.coeffs()[1];
+    out.pose.orientation.z = state_point.rot.coeffs()[2];
+    out.pose.orientation.w = state_point.rot.coeffs()[3];
 }
-void append_tum_pose();
+// void append_tum_pose();
 void publish_odometry(const ros::Publisher &pubOdomAftMapped)
 {
     odomAftMapped.header.frame_id = "camera_init";
@@ -1853,41 +3099,41 @@ void publish_odometry(const ros::Publisher &pubOdomAftMapped)
     br.sendTransform(tf::StampedTransform(transform, odomAftMapped.header.stamp, "camera_init", "body"));
 
     // append current optimized pose in TUM format to file
-    append_tum_pose();
+    // append_tum_pose();
 }
 
 // append current pose in TUM format: t x y z qx qy qz qw
 // pose source: optimized odometry (odomAftMapped)
-void append_tum_pose()
-{
-    static std::ofstream tum_ofs;
-    static bool tum_inited = false;
+// void append_tum_pose()
+// {
+//     static std::ofstream tum_ofs;
+//     static bool tum_inited = false;
 
-    if (!tum_inited)
-    {
-        std::string home = std::getenv("HOME") ? std::getenv("HOME") : std::string(".");
-        std::string tum_path = home + std::string("/fast_lio_sam_pose_tum.txt");
-        tum_ofs.open(tum_path, std::ios::out);
-        if (!tum_ofs.is_open())
-        {
-            ROS_ERROR("Failed to open TUM pose file: %s", tum_path.c_str());
-            return;
-        }
-        tum_inited = true;
-    }
+//     if (!tum_inited)
+//     {
+//         std::string home = std::getenv("HOME") ? std::getenv("HOME") : std::string(".");
+//         std::string tum_path = home + std::string("/fast_lio_sam_pose_tum.txt");
+//         tum_ofs.open(tum_path, std::ios::out);
+//         if (!tum_ofs.is_open())
+//         {
+//             ROS_ERROR("Failed to open TUM pose file: %s", tum_path.c_str());
+//             return;
+//         }
+//         tum_inited = true;
+//     }
 
-    const auto &p = odomAftMapped.pose.pose.position;
-    const auto &q = odomAftMapped.pose.pose.orientation;
+//     const auto &p = odomAftMapped.pose.pose.position;
+//     const auto &q = odomAftMapped.pose.pose.orientation;
 
-    // use lidar_end_time as timestamp (double seconds)
-    double t = lidar_end_time;
+//     // use lidar_end_time as timestamp (double seconds)
+//     double t = lidar_end_time;
 
-    tum_ofs << std::fixed << std::setprecision(6)
-            << t << " "
-            << p.x << " " << p.y << " " << p.z << " "
-            << q.x << " " << q.y << " " << q.z << " " << q.w
-            << std::endl;
-}
+//     tum_ofs << std::fixed << std::setprecision(6)
+//             << t << " "
+//             << p.x << " " << p.y << " " << p.z << " "
+//             << q.x << " " << q.y << " " << q.z << " " << q.w
+//             << std::endl;
+// }
 
 void publish_path(const ros::Publisher pubPath)
 {
@@ -1904,14 +3150,15 @@ void publish_path(const ros::Publisher pubPath)
         pubPath.publish(path);
         
         //  save  unoptimized pose
-         V3D rot_ang(Log( state_point.rot.toRotationMatrix())); //   旋转向量
+        //  V3D rot_ang(Log( state_point.rot.toRotationMatrix())); //   旋转向量
+        Eigen::Vector3d rot_ang = state_point.rot.toRotationMatrix().eulerAngles(2,1,0); // yaw pitch roll
         PointTypePose thisPose6D;  
         thisPose6D.x = msg_body_pose.pose.position.x ;
         thisPose6D.y = msg_body_pose.pose.position.y ;
         thisPose6D.z = msg_body_pose.pose.position.z ;
-        thisPose6D.roll = rot_ang(0) ;
+        thisPose6D.roll = rot_ang(2) ;
         thisPose6D.pitch = rot_ang(1) ;
-        thisPose6D.yaw = rot_ang(2) ;
+        thisPose6D.yaw = rot_ang(0) ;
         fastlio_unoptimized_cloudKeyPoses6D->push_back(thisPose6D);   
     }
 }
@@ -1988,9 +3235,24 @@ bool savePoseService(fast_lio_sam::save_poseRequest& req, fast_lio_sam::save_pos
     string savePoseDirectory;
     cout << "****************************************************" << endl;
     cout << "Saving poses to pose files ..." << endl;
-    if(req.destination.empty()) savePoseDirectory = std::getenv("HOME") + savePCDDirectory;
-    else savePoseDirectory = std::getenv("HOME") + req.destination;
+    if(req.destination.empty()) {
+        // 检查 savePCDDirectory 是否是绝对路径
+        if(savePCDDirectory.empty() || savePCDDirectory[0] == '/') {
+            savePoseDirectory = savePCDDirectory;
+        } else {
+            savePoseDirectory = std::getenv("HOME") + savePCDDirectory;
+        }
+    } else {
+        // 检查 req.destination 是否是绝对路径
+        if(req.destination[0] == '/') {
+            savePoseDirectory = req.destination;
+        } else {
+            savePoseDirectory = std::getenv("HOME") + req.destination;
+        }
+    }
     cout << "Save destination: " << savePoseDirectory << endl;
+    // 创建目录（如果不存在）
+    int unused = system((std::string("mkdir -p ") + savePoseDirectory).c_str());
 
     // create file 
     CreateFile(file_pose_gnss, savePoseDirectory + "/gnss_pose.txt");
@@ -2034,12 +3296,24 @@ bool saveMapService(fast_lio_sam::save_mapRequest& req, fast_lio_sam::save_mapRe
     
       cout << "****************************************************" << endl;
       cout << "Saving map to pcd files ..." << endl;
-      if(req.destination.empty()) saveMapDirectory = std::getenv("HOME") + savePCDDirectory;
-      else saveMapDirectory = std::getenv("HOME") + req.destination;
+      if(req.destination.empty()) {
+          // 检查 savePCDDirectory 是否是绝对路径
+          if(savePCDDirectory.empty() || savePCDDirectory[0] == '/') {
+              saveMapDirectory = savePCDDirectory;
+          } else {
+              saveMapDirectory = std::getenv("HOME") + savePCDDirectory;
+          }
+      } else {
+          // 检查 req.destination 是否是绝对路径
+          if(req.destination[0] == '/') {
+              saveMapDirectory = req.destination;
+          } else {
+              saveMapDirectory = std::getenv("HOME") + req.destination;
+          }
+      }
       cout << "Save destination: " << saveMapDirectory << endl;
-      // 这个代码太坑了！！注释掉
-    //   int unused = system((std::string("exec rm -r ") + saveMapDirectory).c_str());
-    //   unused = system((std::string("mkdir -p ") + saveMapDirectory).c_str());
+      // 创建目录（如果不存在）
+      int unused = system((std::string("mkdir -p ") + saveMapDirectory).c_str());
       // 保存历史关键帧位姿
       pcl::io::savePCDFileBinary(saveMapDirectory + "/trajectory.pcd", *cloudKeyPoses3D);                    // 关键帧位置
       pcl::io::savePCDFileBinary(saveMapDirectory + "/transformations.pcd", *cloudKeyPoses6D);      // 关键帧位姿
@@ -2301,7 +3575,10 @@ int main(int argc, char **argv)
     {
         transformTobeMapped[i] = 0;
     }
-
+    if (if_dynamic) {
+        // cout << "get objects! and size is: " << frames.size() << endl;
+        box_filter.setNegative(true);
+    }
     ros::init(argc, argv, "laserMapping");
     ros::NodeHandle nh;
 
@@ -2328,6 +3605,7 @@ int main(int argc, char **argv)
     nh.param<int>("preprocess/lidar_type", p_pre->lidar_type, AVIA);
     nh.param<int>("preprocess/scan_line", p_pre->N_SCANS, 16);
     nh.param<int>("preprocess/scan_rate", p_pre->SCAN_RATE, 10);
+    nh.param<int>("preprocess/timestamp_unit", p_pre->time_unit, 2); // 0-second, 1-milisecond, 2-microsecond, 3-nanosecond
     nh.param<int>("point_filter_num", p_pre->point_filter_num, 2);
     nh.param<bool>("feature_extract_enable", p_pre->feature_enabled, false);
     nh.param<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
@@ -2349,6 +3627,7 @@ int main(int argc, char **argv)
     nh.param<double>("mappingProcessInterval", mappingProcessInterval, 0.15);
 
     // save keyframes
+    nh.param<bool>("dense_keyframe", dense_keyframe, true);  // true: 关键帧存储feats_undistort, false: 存储feats_down_body
     nh.param<float>("surroundingkeyframeAddingDistThreshold", surroundingkeyframeAddingDistThreshold, 20.0);
     nh.param<float>("surroundingkeyframeAddingAngleThreshold", surroundingkeyframeAddingAngleThreshold, 0.2);
     nh.param<float>("surroundingKeyframeDensity", surroundingKeyframeDensity, 1.0);
@@ -2362,12 +3641,14 @@ int main(int argc, char **argv)
     nh.param<float>("historyKeyframeSearchTimeDiff", historyKeyframeSearchTimeDiff, 30.0);
     nh.param<int>("historyKeyframeSearchNum", historyKeyframeSearchNum, 25);
     nh.param<float>("historyKeyframeFitnessScore", historyKeyframeFitnessScore, 0.3);
+    nh.param<float>("loopClosureNoiseScore", loopClosureNoiseScore, 0.5);  // 闭环噪声值，默认0.5
 
     // gnss
     nh.param<bool>("use_gnss", use_gnss, false);
     nh.param<string>("common/gnss_topic", gnss_topic,"/gps/fix");
     nh.param<vector<double>>("mapping/extrinR_Gnss2Lidar", extrinR_Gnss2Lidar, vector<double>());
     nh.param<vector<double>>("mapping/extrinT_Gnss2Lidar", extrinT_Gnss2Lidar, vector<double>());
+    nh.param<vector<double>>("mapping/t_imu_gnss", t_imu_gnss_vec, vector<double>());
     nh.param<bool>("useImuHeadingInitialization", useImuHeadingInitialization, false);
     nh.param<bool>("useGpsElevation", useGpsElevation, false);
     nh.param<float>("gpsCovThreshold", gpsCovThreshold, 2.0);
@@ -2395,9 +3676,26 @@ int main(int argc, char **argv)
     nh.param<float>("reconstruct_map_leafsize", reconstruct_map_leafsize, 0.5);
     nh.param<int>("add_gps_num_reconstruct", add_gps_num_reconstruct, 3);
 
+        // limot
+    nh.param<float>("limot/Scorethre", Scorethre, 0.5);
+    nh.param<int>("limot/laserCloudInfoHandler_size", laserCloudInfoHandler_size, 10);
+    nh.param<bool>("limot/if_priorfactor", if_priorfactor, true);
+    nh.param<int>("limot/window_size", window_size, 10);
+    nh.param<double>("limot/egoP_egoP", egoP_egoP, 1e-10);
+    nh.param<double>("limot/egoP_objP", egoP_objP, 1e-6);
+    nh.param<double>("limot/ego_stationObjP", ego_stationObjP, 1e-2);
+    nh.param<double>("limot/objP_objP_chgP", objP_objP_chgP, 1e-4);
+    nh.param<double>("limot/chgP_chgP", chgP_chgP, 1e-8);
+    nh.param<double>("limot/rubostNum", rubostNum, 1.0);
+    nh.param<bool>("limot/if_dynamic", if_dynamic, false);
+    // nh.param<bool>("limot/pubtrackedobjects", pubtrackedobjects, false);
+    nh.param<std::string>("limot/sequence", sequence, "09");
+    nh.param<float>("limot/vel_threshold", vel_threshold, 1.0);
+
     // savMap
     nh.param<bool>("savePCD", savePCD, false);
     nh.param<std::string>("savePCDDirectory", savePCDDirectory, "/Downloads/LOAM/");
+    nh.param<int>("mapSaveInterval", mapSaveInterval, -1);  // -1: 只在结束时保存, 1: 每帧保存, N: 每N帧保存
 
     downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
     // downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
@@ -2442,6 +3740,7 @@ int main(int argc, char **argv)
     //设置gnss外参数
     Gnss_T_wrt_Lidar<<VEC_FROM_ARRAY(extrinT_Gnss2Lidar);
     Gnss_R_wrt_Lidar<<MAT_FROM_ARRAY(extrinR_Gnss2Lidar);
+    t_imu_gnss << VEC_FROM_ARRAY(t_imu_gnss_vec);
 
     double epsi[23] = {0.001};
     fill(epsi, epsi + 23, 0.001);
@@ -2473,11 +3772,30 @@ int main(int argc, char **argv)
     ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/Laser_map", 100000);                    //  no used
     ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/Odometry", 100000);
     ros::Publisher pubPath = nh.advertise<nav_msgs::Path>("/path", 1e00000);
-
     ros::Publisher pubPathUpdate = nh.advertise<nav_msgs::Path>("fast_lio_sam/path_update", 100000);                   //  isam更新后的path
+    pubTrackedObjects = nh.advertise<visualization_msgs::MarkerArray>("/tracked_objects", 100);
+    pubObjectTrajectories = nh.advertise<visualization_msgs::MarkerArray>("object_trajectories", 100);
     pubGnssPath = nh.advertise<nav_msgs::Path>("/gnss_path", 100000);
+    pubGnssPoseGT = nh.advertise<std_msgs::String>("/mypose_gt", 1000); // 发布GNSS IMU位姿真值（TUM格式）
     pubLaserCloudSurround = nh.advertise<sensor_msgs::PointCloud2>("fast_lio_sam/mapping/keyframe_submap", 1); // 发布局部关键帧map的特征点云
     pubOptimizedGlobalMap = nh.advertise<sensor_msgs::PointCloud2>("fast_lio_sam/mapping/map_global_optimized", 1); // 发布局部关键帧map的特征点云
+
+    // 检测数据源：优先从文件加载，如果没有文件则订阅topic
+    // 只有在if_dynamic为true时才订阅/加载检测数据
+    if (if_dynamic) {
+        std::string detect_file_path;
+        if (nh.getParam("detect_file_path", detect_file_path) && !detect_file_path.empty()) {
+            ROS_INFO_STREAM("========== Initializing detection file loading at startup ==========");
+            ROS_INFO_STREAM("Using detection file mode, path: " << detect_file_path);
+            std::cout.flush(); // 立即刷新输出
+            loadDetectionsFromFile(detect_file_path);
+        } else {
+            ROS_INFO_STREAM("Using topic subscription mode: /detect3d");
+            subDetect = nh.subscribe<std_msgs::Float64MultiArray>("/detect3d", 200, DetectHandler, ros::TransportHints().tcpNoDelay());
+        }
+    } else {
+        ROS_INFO_STREAM("if_dynamic is false, skipping detection data subscription/loading");
+    }
 
     // loop clousre
     // 发布闭环匹配关键帧局部map
@@ -2632,6 +3950,7 @@ int main(int argc, char **argv)
             correctPoses();
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped);
+            visualizeTrackedObjects();
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
             map_incremental();
@@ -2668,8 +3987,11 @@ int main(int argc, char **argv)
             if (scan_pub_en && scan_body_pub_en)
                 publish_frame_body(pubLaserCloudFull_body);         //  发布imu系下的点云
 
-
-            // if(savePCD)  saveMap();
+            // 按间隔保存地图（如果启用）
+            if (savePCD && mapSaveInterval > 0 && frame_num % mapSaveInterval == 0)
+            {
+                saveMap();
+            }
 
             // publish_effect_world(pubLaserCloudEffect);
             // publish_map(pubLaserCloudMap);
@@ -2719,6 +4041,13 @@ int main(int argc, char **argv)
         pcl::PCDWriter pcd_writer;
         cout << "current scan saved to /PCD/" << file_name << endl;
         pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+    }
+    
+    // 保存完整地图（如果启用，且未使用间隔保存或间隔保存未触发）
+    if (savePCD && (mapSaveInterval <= 0 || frame_num % mapSaveInterval != 0))
+    {
+        cout << "Saving complete map at program exit..." << endl;
+        saveMap();
     }
 
     fout_out.close();

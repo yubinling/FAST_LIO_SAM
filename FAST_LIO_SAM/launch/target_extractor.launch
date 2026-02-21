@@ -1,0 +1,54 @@
+<launch>
+  <!-- Launch file for target pointcloud extractor -->
+  
+  <arg name="rviz" default="true" />
+  <!-- RViz配置文件路径，留空则使用默认配置 -->
+  <arg name="rviz_config" default="$(find fast_lio_sam)/rviz_cfg/target_extractor.rviz" />
+  
+  <!-- 点云话题名称 -->
+  <arg name="cloud_topic" default="/velodyne_points" />
+  <!-- 检测文件路径 -->
+  <arg name="detect_file_path" default="/home/lingyubin/Documents/lyb/livo/fastliosam/src/FAST_LIO_SAM/FAST_LIO_SAM/detectmsg/fast4.txt" />
+  
+  <!-- 目标距离参数（米） -->
+  <arg name="target_distance" default="10.0" />
+  <!-- 距离容差（米） -->
+  <arg name="distance_tolerance" default="2.0" />
+  <!-- 聚类容差（米） -->
+  <arg name="cluster_tolerance" default="0.3" />
+  <!-- 最小聚类点数 -->
+  <arg name="min_cluster_size" default="10" />
+  <!-- 最大聚类点数 -->
+  <arg name="max_cluster_size" default="5000" />
+  <!-- 是否发布原始点云和检测框（用于可视化对比） -->
+  <arg name="publish_original_and_box" default="true" />
+  <!-- 是否启用配准功能（从第二帧开始与上一帧匹配） -->
+  <arg name="enable_registration" default="true" />
+  <!-- 是否发布所有检测框（true=所有框，false=只发布前方固定范围的框） -->
+  <arg name="publish_all_boxes" default="true" />
+  
+  <!-- 目标点云提取节点 -->
+  <node pkg="fast_lio_sam" type="target_pointcloud_extractor" name="target_pointcloud_extractor" output="screen">
+    <param name="cloud_topic" type="string" value="$(arg cloud_topic)" />
+    <param name="detect_file_path" type="string" value="$(arg detect_file_path)" />
+    <param name="target_distance" type="double" value="$(arg target_distance)" />
+    <param name="distance_tolerance" type="double" value="$(arg distance_tolerance)" />
+    <param name="cluster_tolerance" type="double" value="$(arg cluster_tolerance)" />
+    <param name="min_cluster_size" type="int" value="$(arg min_cluster_size)" />
+    <param name="max_cluster_size" type="int" value="$(arg max_cluster_size)" />
+    <param name="publish_original_and_box" type="bool" value="$(arg publish_original_and_box)" />
+    <param name="enable_registration" type="bool" value="$(arg enable_registration)" />
+    <param name="publish_all_boxes" type="bool" value="$(arg publish_all_boxes)" />
+  </node>
+  
+  <!-- 启动RViz进行可视化 -->
+  <!-- 如果rviz=true，总是启动RViz -->
+  <!-- 如果配置文件不存在，RViz会显示警告但继续启动（使用默认配置） -->
+  <group if="$(arg rviz)">
+    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz_target" 
+          args="-d $(arg rviz_config)" 
+          respawn="false" output="screen" />
+  </group>
+  
+</launch>
+
