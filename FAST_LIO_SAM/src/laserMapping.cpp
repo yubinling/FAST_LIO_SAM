@@ -143,6 +143,8 @@ string map_file_path, lid_topic, imu_topic;
 void saveObjectTrackingResult();
 void accumulateTrackedObjectCloud();
 void saveTrackedObjectCloudsIfNeeded(bool force_save);
+void recordIntermediateFrameForMap(const PointTypePose &currentPose6D);
+void flushPendingIntermediateFramesToAnchor(int new_keyframe_index);
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -213,6 +215,24 @@ pcl::PointCloud<PointTypePose>::Ptr copy_cloudKeyPoses6D(new pcl::PointCloud<Poi
 
 pcl::PointCloud<PointTypePose>::Ptr fastlio_unoptimized_cloudKeyPoses6D(new pcl::PointCloud<PointTypePose>()); //  存储fastlio 未优化的位姿
 pcl::PointCloud<PointTypePose>::Ptr gnss_cloudKeyPoses6D(new pcl::PointCloud<PointTypePose>()); //  gnss 轨迹
+
+struct IntermediateFrameRecord {
+    int frame_id = -1;
+    double time = 0.0;
+    PointTypePose relative_pose_to_anchor;
+    pcl::PointCloud<PointType>::Ptr cloud;
+};
+
+struct PendingIntermediateFrameRecord {
+    int frame_id = -1;
+    double time = 0.0;
+    PointTypePose absolute_pose_body;
+    pcl::PointCloud<PointType>::Ptr cloud;
+};
+
+vector<vector<IntermediateFrameRecord>> intermediateFramesPerKeyframe;
+vector<PendingIntermediateFrameRecord> pendingIntermediateFrames;
+vector<PointTypePose> keyframeAnchorCapturePoses;
 
 
 // 物体轨迹管理
@@ -432,6 +452,10 @@ ros::ServiceServer srvSavePose;
 bool savePCD;               // 是否保存地图
 string savePCDDirectory;    // 保存路径
 int mapSaveInterval = -1;   // 地图保存间隔（帧数），-1表示只在程序结束时保存，1表示每帧保存，N表示每N帧保存一次
+int saveMapFrameMode = 0;   // 0: only keyframes, 1: keyframes + intermediate frames
+bool saveMapRecordIntermediateFrames = false;
+int saveMapIntermediateFrameAnchorMode = 0; // 0: previous keyframe, 1: nearest keyframe
+bool saveMapIncludeIntermediateFramesInGlobalMap = false;
 
 
 /**
@@ -538,6 +562,145 @@ PointTypePose trans2PointTypePose(float transformIn[])
     thisPose6D.pitch = transformIn[1];
     thisPose6D.yaw = transformIn[2];
     return thisPose6D;
+}
+
+PointTypePose affine3fToPointTypePose(const Eigen::Affine3f &transformIn, double time = 0.0)
+{
+    PointTypePose thisPose6D;
+    thisPose6D.x = transformIn.translation().x();
+    thisPose6D.y = transformIn.translation().y();
+    thisPose6D.z = transformIn.translation().z();
+    Eigen::Vector3f rpy = transformIn.rotation().eulerAngles(0, 1, 2);
+    thisPose6D.roll = rpy[0];
+    thisPose6D.pitch = rpy[1];
+    thisPose6D.yaw = rpy[2];
+    thisPose6D.time = time;
+    thisPose6D.intensity = 0.0f;
+    return thisPose6D;
+}
+
+pcl::PointCloud<PointType>::Ptr captureFrameCloudForMap()
+{
+    pcl::PointCloud<PointType>::Ptr frameCloud(new pcl::PointCloud<PointType>());
+    if (dense_keyframe)
+        pcl::copyPointCloud(*feats_undistort, *frameCloud);
+    else
+        pcl::copyPointCloud(*feats_down_body, *frameCloud);
+    return frameCloud;
+}
+
+void appendIntermediateFrameToAnchor(
+    int anchor_keyframe_index,
+    const PointTypePose &anchor_pose_body,
+    const PointTypePose &frame_pose_body,
+    pcl::PointCloud<PointType>::Ptr frame_cloud,
+    int frame_id,
+    double time)
+{
+    if (anchor_keyframe_index < 0 || frame_cloud == nullptr || frame_cloud->empty())
+        return;
+
+    if (anchor_keyframe_index >= static_cast<int>(intermediateFramesPerKeyframe.size()))
+        intermediateFramesPerKeyframe.resize(anchor_keyframe_index + 1);
+
+    Eigen::Affine3f T_w_b_anchor = pclPointToAffine3f(anchor_pose_body);
+    Eigen::Affine3f T_w_b_frame = pclPointToAffine3f(frame_pose_body);
+    Eigen::Affine3f T_anchor_to_frame = T_w_b_anchor.inverse() * T_w_b_frame;
+
+    IntermediateFrameRecord record;
+    record.frame_id = frame_id;
+    record.time = time;
+    record.relative_pose_to_anchor = affine3fToPointTypePose(T_anchor_to_frame, time);
+    record.cloud = frame_cloud;
+    intermediateFramesPerKeyframe[anchor_keyframe_index].push_back(record);
+}
+
+void recordIntermediateFrameForMap(const PointTypePose &currentPose6D)
+{
+    bool feature_enabled =
+        saveMapFrameMode == 1 &&
+        saveMapRecordIntermediateFrames;
+
+    if (!feature_enabled)
+        return;
+
+    if (cloudKeyPoses6D->empty() || keyframeAnchorCapturePoses.empty())
+        return;
+
+    pcl::PointCloud<PointType>::Ptr frameCloud = captureFrameCloudForMap();
+    if (!frameCloud || frameCloud->empty())
+        return;
+
+    if (saveMapIntermediateFrameAnchorMode == 0)
+    {
+        int anchor_idx = static_cast<int>(cloudKeyPoses6D->size()) - 1;
+        appendIntermediateFrameToAnchor(
+            anchor_idx,
+            keyframeAnchorCapturePoses.back(),
+            currentPose6D,
+            frameCloud,
+            flow,
+            lidar_end_time);
+    }
+    else
+    {
+        PendingIntermediateFrameRecord pending;
+        pending.frame_id = flow;
+        pending.time = lidar_end_time;
+        pending.absolute_pose_body = currentPose6D;
+        pending.cloud = frameCloud;
+        pendingIntermediateFrames.push_back(pending);
+    }
+}
+
+void flushPendingIntermediateFramesToAnchor(int new_keyframe_index)
+{
+    if (pendingIntermediateFrames.empty())
+        return;
+
+    if (new_keyframe_index < 0 || new_keyframe_index >= static_cast<int>(keyframeAnchorCapturePoses.size()))
+        return;
+
+    int prev_keyframe_index = new_keyframe_index - 1;
+    const PointTypePose &new_anchor_pose = keyframeAnchorCapturePoses[new_keyframe_index];
+
+    if (prev_keyframe_index < 0)
+    {
+        for (const auto &pending : pendingIntermediateFrames)
+        {
+            appendIntermediateFrameToAnchor(
+                new_keyframe_index,
+                new_anchor_pose,
+                pending.absolute_pose_body,
+                pending.cloud,
+                pending.frame_id,
+                pending.time);
+        }
+        pendingIntermediateFrames.clear();
+        return;
+    }
+
+    const PointTypePose &prev_anchor_pose = keyframeAnchorCapturePoses[prev_keyframe_index];
+    for (const auto &pending : pendingIntermediateFrames)
+    {
+        double dist_prev = std::hypot(
+            pending.absolute_pose_body.x - prev_anchor_pose.x,
+            pending.absolute_pose_body.y - prev_anchor_pose.y);
+        double dist_new = std::hypot(
+            pending.absolute_pose_body.x - new_anchor_pose.x,
+            pending.absolute_pose_body.y - new_anchor_pose.y);
+
+        int anchor_idx = dist_prev <= dist_new ? prev_keyframe_index : new_keyframe_index;
+        const PointTypePose &anchor_pose = dist_prev <= dist_new ? prev_anchor_pose : new_anchor_pose;
+        appendIntermediateFrameToAnchor(
+            anchor_idx,
+            anchor_pose,
+            pending.absolute_pose_body,
+            pending.cloud,
+            pending.frame_id,
+            pending.time);
+    }
+    pendingIntermediateFrames.clear();
 }
 
 /**
@@ -1721,7 +1884,9 @@ void saveKeyFramesAndFactor()
     }
     //  计算当前帧与前一帧位姿变换，如果变化太小，不设为关键帧，反之设为关键帧
     if (saveFrame() == false){
-       
+        PointTypePose currentPose6D = trans2PointTypePose(transformTobeMapped);
+        currentPose6D.time = lidar_end_time;
+        recordIntermediateFrameForMap(currentPose6D);
 
         // 局部因子图优化后，不更新自身姿态，保持原来的ESKF状态
         // if (if_dynamic){
@@ -1798,6 +1963,12 @@ void saveKeyFramesAndFactor()
     thisPose6D.yaw = latestEstimate.rotation().yaw();
     thisPose6D.time = lidar_end_time;
     cloudKeyPoses6D->push_back(thisPose6D);
+    keyframeAnchorCapturePoses.push_back(thisPose6D);
+    intermediateFramesPerKeyframe.emplace_back();
+    if (saveMapFrameMode == 1 && saveMapRecordIntermediateFrames && saveMapIntermediateFrameAnchorMode == 1)
+    {
+        flushPendingIntermediateFramesToAnchor(static_cast<int>(cloudKeyPoses6D->size()) - 1);
+    }
 
     // 位姿协方差
     poseCovariance = isam->marginalCovariance(isamCurrentEstimate.size() - 1);
@@ -3829,6 +4000,7 @@ bool savePoseService(fast_lio_sam::save_poseRequest& req, fast_lio_sam::save_pos
 bool saveMapService(fast_lio_sam::save_mapRequest& req, fast_lio_sam::save_mapResponse& res)
 {
       string saveMapDirectory;
+      vector<IntermediateFrameRecord> trailingIntermediateRecords;
     
       cout << "****************************************************" << endl;
       cout << "Saving map to pcd files ..." << endl;
@@ -3850,6 +4022,31 @@ bool saveMapService(fast_lio_sam::save_mapRequest& req, fast_lio_sam::save_mapRe
       cout << "Save destination: " << saveMapDirectory << endl;
       // 创建目录（如果不存在）
       int unused = system((std::string("mkdir -p ") + saveMapDirectory).c_str());
+
+      // 最近关键帧之后残留的中间帧，在导图前临时挂到最后一个关键帧上，仅用于本次导图
+      if (saveMapFrameMode == 1 &&
+          saveMapRecordIntermediateFrames &&
+          saveMapIntermediateFrameAnchorMode == 1 &&
+          !pendingIntermediateFrames.empty() &&
+          !cloudKeyPoses6D->empty())
+      {
+          int last_keyframe_index = static_cast<int>(cloudKeyPoses6D->size()) - 1;
+          const PointTypePose &last_anchor_pose = keyframeAnchorCapturePoses[last_keyframe_index];
+          for (const auto &pending : pendingIntermediateFrames)
+          {
+              Eigen::Affine3f T_w_b_anchor = pclPointToAffine3f(last_anchor_pose);
+              Eigen::Affine3f T_w_b_frame = pclPointToAffine3f(pending.absolute_pose_body);
+              Eigen::Affine3f T_anchor_to_frame = T_w_b_anchor.inverse() * T_w_b_frame;
+
+              IntermediateFrameRecord record;
+              record.frame_id = pending.frame_id;
+              record.time = pending.time;
+              record.relative_pose_to_anchor = affine3fToPointTypePose(T_anchor_to_frame, pending.time);
+              record.cloud = pending.cloud;
+              trailingIntermediateRecords.push_back(record);
+          }
+      }
+
       // 保存历史关键帧位姿
       pcl::io::savePCDFileBinary(saveMapDirectory + "/trajectory.pcd", *cloudKeyPoses3D);                    // 关键帧位置
       pcl::io::savePCDFileBinary(saveMapDirectory + "/transformations.pcd", *cloudKeyPoses6D);      // 关键帧位姿
@@ -3865,7 +4062,68 @@ bool saveMapService(fast_lio_sam::save_mapRequest& req, fast_lio_sam::save_mapRe
       for (int i = 0; i < (int)cloudKeyPoses6D->size(); i++) {
             //   *globalCornerCloud += *transformPointCloud(cornerCloudKeyFrames[i],  &cloudKeyPoses6D->points[i]);
             *globalSurfCloud   += *transformPointCloud(surfCloudKeyFrames[i],    &cloudKeyPoses6D->points[i]);
+
+            if (saveMapFrameMode == 1 &&
+                saveMapRecordIntermediateFrames &&
+                saveMapIncludeIntermediateFramesInGlobalMap &&
+                i < static_cast<int>(intermediateFramesPerKeyframe.size()))
+            {
+                for (const auto &intermediate : intermediateFramesPerKeyframe[i])
+                {
+                    Eigen::Affine3f T_w_b_anchor = pclPointToAffine3f(cloudKeyPoses6D->points[i]);
+                    Eigen::Affine3f T_anchor_to_frame = pclPointToAffine3f(intermediate.relative_pose_to_anchor);
+                    Eigen::Affine3f T_w_b_frame = T_w_b_anchor * T_anchor_to_frame;
+                    PointTypePose frame_pose_world = affine3fToPointTypePose(T_w_b_frame, intermediate.time);
+                    *globalSurfCloud += *transformPointCloud(intermediate.cloud, &frame_pose_world);
+                }
+
+                if (i == static_cast<int>(cloudKeyPoses6D->size()) - 1)
+                {
+                    for (const auto &intermediate : trailingIntermediateRecords)
+                    {
+                        Eigen::Affine3f T_w_b_anchor = pclPointToAffine3f(cloudKeyPoses6D->points[i]);
+                        Eigen::Affine3f T_anchor_to_frame = pclPointToAffine3f(intermediate.relative_pose_to_anchor);
+                        Eigen::Affine3f T_w_b_frame = T_w_b_anchor * T_anchor_to_frame;
+                        PointTypePose frame_pose_world = affine3fToPointTypePose(T_w_b_frame, intermediate.time);
+                        *globalSurfCloud += *transformPointCloud(intermediate.cloud, &frame_pose_world);
+                    }
+                }
+            }
             cout << "\r" << std::flush << "Processing feature cloud " << i << " of " << cloudKeyPoses6D->size() << " ...";
+      }
+
+      if (saveMapFrameMode == 1 && saveMapRecordIntermediateFrames)
+      {
+          std::ofstream relativePoseOut(saveMapDirectory + "/intermediate_frame_relative_poses.txt", std::ios::out);
+          if (relativePoseOut.is_open())
+          {
+              relativePoseOut << "# anchor_keyframe_index frame_id time rel_x rel_y rel_z rel_roll rel_pitch rel_yaw\n";
+              for (int anchor_idx = 0; anchor_idx < static_cast<int>(intermediateFramesPerKeyframe.size()); ++anchor_idx)
+              {
+                  for (const auto &intermediate : intermediateFramesPerKeyframe[anchor_idx])
+                  {
+                      const auto &rel = intermediate.relative_pose_to_anchor;
+                      relativePoseOut << anchor_idx << " "
+                                      << intermediate.frame_id << " "
+                                      << std::fixed << std::setprecision(6)
+                                      << intermediate.time << " "
+                                      << rel.x << " " << rel.y << " " << rel.z << " "
+                                      << rel.roll << " " << rel.pitch << " " << rel.yaw << "\n";
+                  }
+              }
+              int trailing_anchor_idx = static_cast<int>(cloudKeyPoses6D->size()) - 1;
+              for (const auto &intermediate : trailingIntermediateRecords)
+              {
+                  const auto &rel = intermediate.relative_pose_to_anchor;
+                  relativePoseOut << trailing_anchor_idx << " "
+                                  << intermediate.frame_id << " "
+                                  << std::fixed << std::setprecision(6)
+                                  << intermediate.time << " "
+                                  << rel.x << " " << rel.y << " " << rel.z << " "
+                                  << rel.roll << " " << rel.pitch << " " << rel.yaw << "\n";
+              }
+              relativePoseOut.close();
+          }
       }
 
       if(req.resolution != 0)
@@ -4244,6 +4502,10 @@ int main(int argc, char **argv)
     nh.param<bool>("savePCD", savePCD, false);
     nh.param<std::string>("savePCDDirectory", savePCDDirectory, "/Downloads/LOAM/");
     nh.param<int>("mapSaveInterval", mapSaveInterval, -1);  // -1: 只在结束时保存, 1: 每帧保存, N: 每N帧保存
+    nh.param<int>("saveMapFrameMode", saveMapFrameMode, 0);
+    nh.param<bool>("saveMapRecordIntermediateFrames", saveMapRecordIntermediateFrames, false);
+    nh.param<int>("saveMapIntermediateFrameAnchorMode", saveMapIntermediateFrameAnchorMode, 0);
+    nh.param<bool>("saveMapIncludeIntermediateFramesInGlobalMap", saveMapIncludeIntermediateFramesInGlobalMap, false);
 
     downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
     // downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);

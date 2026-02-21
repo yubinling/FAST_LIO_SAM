@@ -158,4 +158,18 @@ add_gps_num_reconstruct: 4                              #在添加gps的时候�
 # Export settings
 savePCD: true                         # https://github.com/TixiaoShan/LIO-SAM/issues/3
 savePCDDirectory: "/home/lingyubin/Documents/lyb/livo/fastliosam_detect/src/FAST_LIO_SAM/FAST_LIO_SAM/result"        # in your home folder, starts and ends with "/". Warning: the code deletes "LOAM" folder then recreates it. See "mapOptimization" for implementation
+# saveMapFrameMode:
+#   0: 只保存关键帧点云（当前默认行为）
+#   1: 关键帧为锚点，同时记录两个关键帧之间的其他帧，并保存这些帧相对于锚点关键帧的位姿，再一起构建/导出地图
+saveMapFrameMode: 0
+# 当 saveMapFrameMode=1 时：
+#   true: 记录非关键帧，并保存其相对于所属关键帧锚点的相对位姿
+#   false: 不记录非关键帧，仍只使用关键帧
+saveMapRecordIntermediateFrames: true
+# 非关键帧归属方式：
+#   0: 归属到前一个关键帧（推荐，在线处理更简单）
+#   1: 归属到最近关键帧（需要额外判断）
+saveMapIntermediateFrameAnchorMode: 0
+# 保存地图时，是否把这些非关键帧也一并展开到全局地图
+saveMapIncludeIntermediateFramesInGlobalMap: true
 
