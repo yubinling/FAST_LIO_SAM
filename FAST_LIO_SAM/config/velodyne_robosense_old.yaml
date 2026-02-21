@@ -17,38 +17,9 @@ common:
 #    lid_topic: "/rslidar"
 #    imu_topic: "/imu"
 limot:
-  Scorethre: 0.5                        #recommend: 0.5
+  Scorethre: 0.6                        #recommend: 0.5
   if_priorfactor: false
   if_dynamic: false
-  # dynamic_filter_mode: 三种点云剔除模式 (仅在 if_dynamic=true 时有效)
-  #   0: 不剔除 (保持 FAST-LIO-SAM 原始行为)
-  #   1: 每帧开始时, 使用这一帧所有检测框, 直接在输入点云(lidar系)中剔除框内点; 后续建图/发布都用已剔除后的点云
-  #   2: 只剔除动态框; 建图仍用完整点云, 仅在发布 world 系点云时, 在 world 系下剔除动态框对应点
-  dynamic_filter_mode: 1
-  # 指定某个跟踪目标 id 的局部点云累计功能（默认关闭，不影响原有流程）
-  # frontBoxTargetObjectId:
-  #   >=0: 只累计这个 object_id 的目标点云
-  #   -1: 关闭此功能
-  frontBoxTargetObjectId: 1
-  # frontBoxPublishMaxFrames:
-  #   0: 关闭累计
-  #   -1: 一直累计，直到程序退出时再保存 PCD
-  #   >0: 累计到 N 个有效帧后自动保存，并停止继续累计
-  frontBoxPublishMaxFrames: 0
-  # 如果为 true，则把每帧目标局部点云直接累计，并在保存时输出 *_accumulated.pcd
-  frontBoxAccumulateForPcd: true
-  # 每帧累计时加一点随机偏移，避免多帧完全重合
-  frontBoxAccumulateRandomOffsetXMin: 0.4
-  frontBoxAccumulateRandomOffsetXMax: -0.3
-  frontBoxAccumulateRandomOffsetYMin: 0.5
-  frontBoxAccumulateRandomOffsetYMax: -0.4
-  frontBoxAccumulateRandomOffsetZMin: 0.2
-  frontBoxAccumulateRandomOffsetZMax: -0.2
-  # 如果为 true，则将每帧目标局部点云通过 ICP 对齐到累计地图，并在保存时输出 *_icp_map.pcd
-  frontBoxIcpMap: true
-  # Scorethre: 0.6                        #recommend: 0.5
-  # if_priorfactor: false
-  # if_dynamic: false
 #   pubtrackedobjects
   window_size: 5
   egoP_egoP: 1.0e-6
@@ -57,29 +28,33 @@ limot:
   objP_objP_chgP: 1.0
   chgP_chgP: 1.0e-2
   rubostNum: 1.0 
-  saveObject: true
-  saveObjectResult: true
-  saveFramePose: true
+  saveObject: false
+  saveObjectResult: false
+  saveFramePose: false
   sequence: "04"
   vel_threshold: 1.0
   laserCloudInfoHandler_size: 100   # 100 is enough
     
 preprocess:
     lidar_type: 2                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 
-    scan_line: 80
+    scan_line: 32
     scan_rate: 10                # only need to be set for velodyne, unit: Hz,
     timestamp_unit: 0            # the unit of time/t field in the PointCloud2 rostopic: 0-second, 1-milisecond, 2-microsecond, 3-nanosecond.
-    blind: 1
+    blind: 2
 
 mapping:
-    acc_cov: 3.9939570888238808e-03
-    gyr_cov: 1.5636343949698187e-03
-    b_acc_cov: 6.4356659353532566e-05
-    b_gyr_cov: 3.5640318696367613e-05
+    acc_cov: 5.1047775589866716e-03
+    #gyr_cov: 1.5636343949698187e-03
+    gyr_cov: 2.3503716891509098e-04
+    # gyr_cov: 0.1
+    #b_acc_cov: 6.4356659353532566e-05
+    b_acc_cov: 1.2745088891072094e-04
+    #b_gyr_cov: 3.5640318696367613e-05
+    b_gyr_cov: 6.1767472101311034e-06
     fov_degree:    180
     det_range:     100.0
-    extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic,
-    extrinsic_T: [ 0.021, -0.24, 1.408 ]
+    extrinsic_est_en:  true      # true: enable the online estimation of IMU-LiDAR extrinsic,
+    extrinsic_T: [ 0.021, -0.22, 1.39036 ]
     extrinsic_R: [ 0.0356581, -0.999341,  -0.00671807,
                     0.999364,  0.0356532,  0.000837854,
                    -0.000597781, -0.00674367,  0.999977]
@@ -127,7 +102,7 @@ historyKeyframeFitnessScore: 0.2              # icp threshold, the smaller the b
 loopClosureNoiseScore: 0.01                    # loop closure noise score for factor graph optimization (variance)
 
 # GPS Settings
-use_gnss: false                       # true: add GPS factors
+use_gnss: false                             # true: add GPS factors
 useImuHeadingInitialization: true           # if using GPS data, set to "true"
 useGpsElevation: true                     # if GPS elevation is bad, set to "false"
 gpsCovThreshold: 2.0                        # m^2, threshold for using GPS data
@@ -157,5 +132,5 @@ add_gps_num_reconstruct: 4                              #在添加gps的时候�
 
 # Export settings
 savePCD: true                         # https://github.com/TixiaoShan/LIO-SAM/issues/3
-savePCDDirectory: "/home/lingyubin/Documents/lyb/livo/fastliosam_detect/src/FAST_LIO_SAM/FAST_LIO_SAM/result"        # in your home folder, starts and ends with "/". Warning: the code deletes "LOAM" folder then recreates it. See "mapOptimization" for implementation
+savePCDDirectory: "/home/lingyubin/Documents/lyb/livo/fastliosam/src/FAST_LIO_SAM/FAST_LIO_SAM/result"        # in your home folder, starts and ends with "/". Warning: the code deletes "LOAM" folder then recreates it. See "mapOptimization" for implementation
 

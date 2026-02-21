@@ -112,6 +112,8 @@
 #include <sstream>
 #include <fstream>
 #include <iomanip>
+#include <chrono>
+#include <random>
 
 // using namespace gtsam;
 
@@ -125,7 +127,7 @@ double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_ti
 double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_plot5[MAXN], s_plot6[MAXN], s_plot7[MAXN], s_plot8[MAXN], s_plot9[MAXN], s_plot10[MAXN], s_plot11[MAXN];
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
-bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
+bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true, saveObjectResult = false;
 /**************************/
 
 float res_last[100000] = {0.0}; //残差，点到面距离平方和
@@ -137,6 +139,10 @@ condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
+
+void saveObjectTrackingResult();
+void accumulateTrackedObjectCloud();
+void saveTrackedObjectCloudsIfNeeded(bool force_save);
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -218,6 +224,26 @@ struct ObjectTrajectory {
 };
 std::map<int, ObjectTrajectory> object_trajectories;  // object_id -> trajectory
 
+// 指定 object_id 的局部点云累计（默认关闭，不影响原有跟踪/建图流程）
+int frontBoxTargetObjectId = -1;
+int frontBoxPublishMaxFrames = 0;  // 0: disabled, -1: unlimited until exit, >0: save after N valid frames
+bool frontBoxAccumulateForPcd = false;
+double frontBoxAccumulateRandomOffsetXMin = -0.2;
+double frontBoxAccumulateRandomOffsetXMax = 0.2;
+double frontBoxAccumulateRandomOffsetYMin = -0.3;
+double frontBoxAccumulateRandomOffsetYMax = 0.3;
+double frontBoxAccumulateRandomOffsetZMin = -0.3;
+double frontBoxAccumulateRandomOffsetZMax = 0.3;
+bool frontBoxIcpMap = false;
+int frontBoxPublishFrameCount = 0;
+int frontBoxSkipNoDetection = 0;
+int frontBoxSkipEmptyCloud = 0;
+bool frontBoxAccumulatedCloudSaved = false;
+bool frontBoxIcpMapSaved = false;
+std::ofstream frontBoxLogStream;
+PointCloudXYZI::Ptr frontBoxAccumulatedCloud;
+PointCloudXYZI::Ptr frontBoxIcpMapCloud;
+
 
 // voxel filter paprams
 float odometrySurfLeafSize;
@@ -267,6 +293,7 @@ gtsam::NonlinearFactorGraph graph_temp;
 vector<LidarSLAMFrame, Eigen::aligned_allocator<LidarSLAMFrame>> frames;
 Tracker tracker;
 int flow = 0;
+std::ofstream objectResultStream;  // 保存每帧目标跟踪结果
 map<int, std::vector<int>> priorfactor_id;
 map<int, std::vector<int>> priorfactor_egoP_id;
 map<int, std::vector<std::pair<int, int>>> priorfactor_objP_id; //<flow,<f_id,obj_k>>
@@ -280,6 +307,7 @@ ros::Publisher pubLoopConstraintEdge;
 // ros::Publisher pubTrackObjects;  //发布跟踪物体的边界框
 ros::Publisher pubTrackedObjects;
 ros::Publisher pubObjectTrajectories;
+ros::Publisher pubTrackedObjectLocalCloud;
 ros::Subscriber subDetect;
 
 
@@ -316,12 +344,15 @@ pcl::VoxelGrid<PointType> downSizeFilterCorner;
 pcl::VoxelGrid<PointType> downSizeFilterICP;
 pcl::VoxelGrid<PointType> downSizeFilterSurroundingKeyPoses; // for surrounding key poses of scan-to-map optimization
 
-//动态剔除点
-    // filter dynamic points
-std::queue<std::vector<double>> dynamBoxBuf; // [x,y,z,yaw,l,w,h]
+// 动态剔除点相关
+// filter dynamic points / detected boxes
+std::queue<std::vector<double>> dynamBoxBuf; // 来自 limot tracker 的动态框: [x, y, z, ?, l, w, h, yaw]
 pcl::CropBox<PointType> box_filter;
-// pcl::PointCloud<PointType>::Ptr cloud_filter_corner;
-pcl::PointCloud<PointType>::Ptr cloud_filter_surf;
+// three modes:
+// 0 - no filtering (保持原始行为)
+// 1 - 在每帧处理开始时, 用"这一帧的所有检测框"直接从输入点云中剔除对应区域, 后面的建图/发布都使用已剔除后的点云
+// 2 - 仅剔除动态框: 建图仍用原始点云, 只在发布 world 点云时, 在 world 系对动态框对应区域做剔除
+int dynamic_filter_mode = 0;
 
 float transformTobeMapped[6]; //  当前帧的位姿(world系下)
 
@@ -1387,9 +1418,12 @@ bool setFrame() {
             Eigen::Vector3f rotation_zyx = Eigen::Vector3f(float(thisDec.data[8 + 9 * i]), 0.0, 0.0);
             for (int i = 0; i < 3; i++) {
                 ob.local_xyz[i] = local_xyz[i];
+                ob.detect_local_xyz[i] = local_xyz[i];
                 ob.rotation_zyx[i] = rotation_zyx(i);
+                ob.detect_rotation_zyx[i] = rotation_zyx(i);
                 ob.measure_lwh[i] = measure_lwh(i);
             }
+            ob.has_detect_pose = true;
             // Eigen::Affine3f local_t = Eigen::Affine3f::Identity();
             // local_t = pcl::getTransformation(local_xyz[0], local_xyz[1], local_xyz[2], 0, 0, rotation_zyx[0]);
             // ob.pose_inimu[0] = local_t.rotation().eulerAngles(0, 1, 2)[0];
@@ -1664,6 +1698,10 @@ void saveKeyFramesAndFactor()
                     }
                 }
             }
+
+            // 目标优化完成后，保存当前帧所有目标的优化位姿到文本文件
+            saveObjectTrackingResult();
+            accumulateTrackedObjectCloud();
 
             // 局部因子图优化后，不更新自身姿态，保持原来的transformTobeMapped
             // transformTobeMapped[0] = this_pose.rotation().roll();
@@ -2398,6 +2436,268 @@ void SigHandle(int sig)
     sig_buffer.notify_all();
 }
 
+// 将当前帧中所有已初始化目标的优化后位姿写入文本文件
+// 格式: frame_id object_id X Y Z yaw score
+void saveObjectTrackingResult()
+{
+    if (!saveObjectResult)
+        return;
+
+    if (!objectResultStream.is_open())
+        return;
+
+    if (flow < 0 || flow >= static_cast<int>(frames.size()))
+        return;
+
+    const LidarSLAMFrame &current_frame = frames[flow];
+
+    for (const auto &obj : current_frame.objects)
+    {
+        if (!obj.initialized || obj.object_id < 0)
+            continue;
+
+        objectResultStream << std::fixed << std::setprecision(6)
+                           << current_frame.frame_id << " "
+                           << obj.object_id << " "
+                           << obj.optimize_t[3] << " "
+                           << obj.optimize_t[4] << " "
+                           << obj.optimize_t[5] << " "
+                           << obj.optimize_t[2] << " "
+                           << obj.score << std::endl;
+    }
+
+    objectResultStream.flush();
+}
+
+void ensureFrontBoxLogOpen()
+{
+    if (frontBoxLogStream.is_open())
+        return;
+
+    std::string log_dir = root_dir + "/Log";
+    boost::filesystem::create_directories(log_dir);
+    std::string log_path = log_dir + "/tracked_object_cloud.log";
+    frontBoxLogStream.open(log_path, std::ios::out | std::ios::app);
+}
+
+void saveTrackedObjectCloudsIfNeeded(bool force_save)
+{
+    bool feature_enabled =
+        frontBoxTargetObjectId >= 0 &&
+        frontBoxPublishMaxFrames != 0 &&
+        (frontBoxAccumulateForPcd || frontBoxIcpMap);
+
+    if (!feature_enabled)
+        return;
+
+    bool reach_limit = frontBoxPublishMaxFrames > 0 && frontBoxPublishFrameCount >= frontBoxPublishMaxFrames;
+    if (!force_save && !reach_limit)
+        return;
+
+    std::string save_dir = root_dir + "/PCD";
+    boost::filesystem::create_directories(save_dir);
+    ensureFrontBoxLogOpen();
+
+    if (frontBoxAccumulateForPcd && frontBoxAccumulatedCloud && !frontBoxAccumulatedCloud->empty())
+    {
+        std::string pcd_path = save_dir + "/tracked_object_id_" + std::to_string(frontBoxTargetObjectId) + "_accumulated.pcd";
+        if (force_save || !frontBoxAccumulatedCloudSaved)
+        {
+            int ret = pcl::io::savePCDFileBinary(pcd_path, *frontBoxAccumulatedCloud);
+            if (frontBoxLogStream.is_open())
+            {
+                if (ret == 0)
+                {
+                    frontBoxLogStream << "[trackedObjectCloud] Saved accumulated PCD: object_id=" << frontBoxTargetObjectId
+                                      << ", points=" << frontBoxAccumulatedCloud->size()
+                                      << ", valid_frames=" << frontBoxPublishFrameCount
+                                      << ", skips_no_detection=" << frontBoxSkipNoDetection
+                                      << ", skips_empty_cloud=" << frontBoxSkipEmptyCloud
+                                      << " -> " << pcd_path << std::endl;
+                }
+                else
+                {
+                    frontBoxLogStream << "[trackedObjectCloud] WARN: failed to save accumulated PCD -> "
+                                      << pcd_path << std::endl;
+                }
+                frontBoxLogStream.flush();
+            }
+            if (ret == 0)
+                frontBoxAccumulatedCloudSaved = true;
+        }
+    }
+
+    if (frontBoxIcpMap && frontBoxIcpMapCloud && !frontBoxIcpMapCloud->empty())
+    {
+        std::string pcd_path = save_dir + "/tracked_object_id_" + std::to_string(frontBoxTargetObjectId) + "_icp_map.pcd";
+        if (force_save || !frontBoxIcpMapSaved)
+        {
+            int ret = pcl::io::savePCDFileBinary(pcd_path, *frontBoxIcpMapCloud);
+            if (frontBoxLogStream.is_open())
+            {
+                if (ret == 0)
+                {
+                    frontBoxLogStream << "[trackedObjectCloud] Saved ICP map PCD: object_id=" << frontBoxTargetObjectId
+                                      << ", points=" << frontBoxIcpMapCloud->size()
+                                      << ", valid_frames=" << frontBoxPublishFrameCount
+                                      << " -> " << pcd_path << std::endl;
+                }
+                else
+                {
+                    frontBoxLogStream << "[trackedObjectCloud] WARN: failed to save ICP map PCD -> "
+                                      << pcd_path << std::endl;
+                }
+                frontBoxLogStream.flush();
+            }
+            if (ret == 0)
+                frontBoxIcpMapSaved = true;
+        }
+    }
+}
+
+void accumulateTrackedObjectCloud()
+{
+    bool feature_enabled =
+        frontBoxTargetObjectId >= 0 &&
+        frontBoxPublishMaxFrames != 0 &&
+        (frontBoxAccumulateForPcd || frontBoxIcpMap);
+
+    if (!feature_enabled)
+        return;
+
+    if (frontBoxPublishMaxFrames > 0 && frontBoxPublishFrameCount >= frontBoxPublishMaxFrames)
+        return;
+
+    if (flow < 0 || flow >= static_cast<int>(frames.size()))
+        return;
+
+    if (!feats_undistort || feats_undistort->empty())
+        return;
+
+    const LidarSLAMFrame &current_frame = frames[flow];
+    const LidarSLAMObject *selected = nullptr;
+    for (const auto &obj : current_frame.objects)
+    {
+        if (obj.object_id == frontBoxTargetObjectId && obj.has_detect_pose && obj.obj_status == 1)
+        {
+            selected = &obj;
+            break;
+        }
+    }
+
+    if (selected == nullptr)
+    {
+        ++frontBoxSkipNoDetection;
+        return;
+    }
+
+    Eigen::Vector3f center_lidar(selected->detect_local_xyz[0], selected->detect_local_xyz[1], selected->detect_local_xyz[2]);
+    float hx = 0.5f * selected->measure_lwh[0];
+    float hy = 0.5f * selected->measure_lwh[1];
+    float hz = 0.5f * selected->measure_lwh[2];
+    float yaw_lidar = selected->detect_rotation_zyx[0];
+    Eigen::Matrix3f R_lidar =
+        Eigen::AngleAxisf(yaw_lidar, Eigen::Vector3f::UnitZ()).toRotationMatrix();
+
+    PointCloudXYZI::Ptr cloudLocal(new PointCloudXYZI());
+    cloudLocal->reserve(feats_undistort->size());
+    for (const auto &pt : feats_undistort->points)
+    {
+        Eigen::Vector3f p_lidar(pt.x, pt.y, pt.z);
+        Eigen::Vector3f p_local = R_lidar.transpose() * (p_lidar - center_lidar);
+        if (std::fabs(p_local.x()) <= hx &&
+            std::fabs(p_local.y()) <= hy &&
+            std::fabs(p_local.z()) <= hz)
+        {
+            PointType out;
+            out.x = p_local.x();
+            out.y = p_local.y();
+            out.z = p_local.z();
+            out.intensity = pt.intensity;
+            cloudLocal->push_back(out);
+        }
+    }
+
+    if (cloudLocal->empty())
+    {
+        ++frontBoxSkipEmptyCloud;
+        return;
+    }
+
+    static std::default_random_engine rng(std::chrono::system_clock::now().time_since_epoch().count());
+
+    if (frontBoxAccumulateForPcd)
+    {
+        if (!frontBoxAccumulatedCloud)
+            frontBoxAccumulatedCloud.reset(new PointCloudXYZI());
+
+        std::uniform_real_distribution<float> dist_x(frontBoxAccumulateRandomOffsetXMin, frontBoxAccumulateRandomOffsetXMax);
+        std::uniform_real_distribution<float> dist_y(frontBoxAccumulateRandomOffsetYMin, frontBoxAccumulateRandomOffsetYMax);
+        std::uniform_real_distribution<float> dist_z(frontBoxAccumulateRandomOffsetZMin, frontBoxAccumulateRandomOffsetZMax);
+        const float dx = dist_x(rng);
+        const float dy = dist_y(rng);
+        const float dz = dist_z(rng);
+
+        for (const auto &pt : cloudLocal->points)
+        {
+            PointType p = pt;
+            p.x += dx;
+            p.y += dy;
+            p.z += dz;
+            frontBoxAccumulatedCloud->push_back(p);
+        }
+    }
+
+    if (frontBoxIcpMap)
+    {
+        if (!frontBoxIcpMapCloud)
+            frontBoxIcpMapCloud.reset(new PointCloudXYZI());
+
+        if (frontBoxIcpMapCloud->empty())
+        {
+            *frontBoxIcpMapCloud += *cloudLocal;
+        }
+        else
+        {
+            pcl::IterativeClosestPoint<PointType, PointType> icp;
+            icp.setInputSource(cloudLocal);
+            icp.setInputTarget(frontBoxIcpMapCloud);
+            icp.setMaximumIterations(50);
+            icp.setMaxCorrespondenceDistance(1.0);
+            icp.setTransformationEpsilon(1e-6);
+            PointCloudXYZI::Ptr aligned(new PointCloudXYZI());
+            icp.align(*aligned);
+            if (icp.hasConverged())
+                *frontBoxIcpMapCloud += *aligned;
+            else
+                *frontBoxIcpMapCloud += *cloudLocal;
+        }
+    }
+
+    int nextCount = frontBoxPublishFrameCount + 1;
+
+    if (nextCount % 10 == 0 || (frontBoxPublishMaxFrames > 0 && nextCount >= frontBoxPublishMaxFrames))
+    {
+        ensureFrontBoxLogOpen();
+        if (frontBoxLogStream.is_open())
+        {
+            frontBoxLogStream << "[trackedObjectCloud] object_id=" << frontBoxTargetObjectId
+                              << ", valid_frames=" << nextCount
+                              << ", target_frames=" << frontBoxPublishMaxFrames
+                              << ", skips_no_detection=" << frontBoxSkipNoDetection
+                              << ", skips_empty_cloud=" << frontBoxSkipEmptyCloud << std::endl;
+            frontBoxLogStream.flush();
+        }
+    }
+
+    // 按有效帧逐帧发布当前目标的局部点云，便于在线查看当前提取效果
+    publishCloud(&pubTrackedObjectLocalCloud, cloudLocal, ros::Time().fromSec(lidar_end_time), "camera_init");
+
+    ++frontBoxPublishFrameCount;
+
+    saveTrackedObjectCloudsIfNeeded(false);
+}
+
 inline void dump_lio_state_to_log(FILE *fp)
 {
     // TUM format: timestamp x y z qx qy qz qw
@@ -2712,8 +3012,6 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
         first_gnss_imu_rot = q_imu;
         gnss_inited = true ;
     }else{
-        if (gnss_data.status < 0)
-            return;                               //   初始化完成
         gnss_data.UpdateXYZ(msg_in->latitude, msg_in->longitude, msg_in->altitude) ;             //  WGS84 -> ENU  ???  调试结果好像是 NED 北东地
 
         Eigen::Vector3d gnss_pose = Eigen::Vector3d::Zero() ;
@@ -2742,7 +3040,9 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
         gnss_data_enu.pose.covariance[7] = gnss_data.pose_cov[1] ;
         gnss_data_enu.pose.covariance[14] = gnss_data.pose_cov[2] ;
 
-        gnss_buffer.push_back(gnss_data_enu);
+        // 保持原有 GNSS 因子逻辑: 只有有效状态的 GNSS 才进入 gnss_buffer
+        if (gnss_data.status >= 0)
+            gnss_buffer.push_back(gnss_data_enu);
 
         // visial gnss path in rviz:
         msg_gnss_pose.header.frame_id = "camera_init";
@@ -2956,21 +3256,257 @@ void map_incremental()
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
+
+// 使用当前帧的检测结果(所有检测框), 在 lidar 系下直接从输入点云中剔除对应区域
+// 仅在 dynamic_filter_mode == 1 时调用; 为避免影响 limot 的图优化, 本函数不会修改 decQueue 的内容
+void filterAllDetectionBoxesOnScan()
+{
+    if (!if_dynamic || dynamic_filter_mode != 1)
+        return;
+
+    if (feats_undistort == nullptr || feats_undistort->empty())
+        return;
+
+    // 当前雷达帧时间
+    double timeLaserInfoCur = lidar_start_time;
+    const double TIMESTAMP_TOLERANCE = 0.001;
+
+    // 查找时间戳匹配的检测数据 (仅读取, 不 pop)
+    std_msgs::Float64MultiArray matchedDec;
+    bool hasMatched = false;
+    {
+        std::lock_guard<std::mutex> lock(decLock);
+        for (size_t idx = 0; idx < decQueue.size(); ++idx)
+        {
+            const auto &thisDec = decQueue[idx];
+            if (thisDec.data.empty())
+                continue;
+            double timeDiff = std::fabs(thisDec.data[0] - timeLaserInfoCur);
+            if (timeDiff < TIMESTAMP_TOLERANCE)
+            {
+                matchedDec = thisDec;
+                hasMatched = true;
+                break;
+            }
+            // decQueue 时间有序, 且后面的时间只会更晚, 超过容差就可以提前结束
+            if (thisDec.data[0] - timeLaserInfoCur > TIMESTAMP_TOLERANCE)
+                break;
+        }
+    }
+
+    if (!hasMatched)
+        return;
+
+    if (matchedDec.data.size() < 1)
+        return;
+
+    // 检测数据格式: [timestamp, type, x, y, z, l, w, h, yaw, score, ...]
+    if ((matchedDec.data.size() - 1) % 9 != 0)
+        return;
+
+    int ob_num = (matchedDec.data.size() - 1) / 9;
+    if (ob_num <= 0)
+        return;
+
+    // 以检测框为单位, 在 lidar 系下对 feats_undistort 做负向 CropBox
+    box_filter.setNegative(true);
+
+    PointCloudXYZI::Ptr cloud_current(new PointCloudXYZI);
+    pcl::copyPointCloud(*feats_undistort, *cloud_current);
+
+    for (int i = 0; i < ob_num; ++i)
+    {
+        double type = matchedDec.data[1 + 9 * i];
+        // 这里沿用 setFrame 的筛选习惯: 只处理 type == 0 的目标
+        if (type != 0.0)
+            continue;
+
+        double x = matchedDec.data[2 + 9 * i];
+        double y = matchedDec.data[3 + 9 * i];
+        double z = matchedDec.data[4 + 9 * i];
+        double l = matchedDec.data[5 + 9 * i];
+        double w = matchedDec.data[6 + 9 * i];
+        double h = matchedDec.data[7 + 9 * i];
+        double yaw = matchedDec.data[8 + 9 * i];
+
+        // 略微扩展盒子, 防止边界残留
+        double expand_in = 0.1;
+        double expand_out = 0.1;
+
+        box_filter.setMin(Eigen::Vector4f(static_cast<float>(-l / 2.0 - expand_in),
+                                          static_cast<float>(-w / 2.0 - expand_in),
+                                          static_cast<float>(-h / 2.0 - expand_in),
+                                          1.0f));
+        box_filter.setMax(Eigen::Vector4f(static_cast<float>(l / 2.0 + expand_out),
+                                          static_cast<float>(w / 2.0 + expand_out),
+                                          static_cast<float>(h / 2.0 + expand_out),
+                                          1.0f));
+        box_filter.setTranslation(Eigen::Vector3f(static_cast<float>(x),
+                                                  static_cast<float>(y),
+                                                  static_cast<float>(z)));
+        box_filter.setRotation(Eigen::Vector3f(0.0f, 0.0f, static_cast<float>(yaw)));
+
+        PointCloudXYZI::Ptr cloud_filtered(new PointCloudXYZI);
+        box_filter.setInputCloud(cloud_current);
+        box_filter.filter(*cloud_filtered);
+        cloud_current.swap(cloud_filtered);
+    }
+
+    // 将剔除后的点云写回 feats_undistort, 后续所有流程(下采样 / 建图 / 发布)都使用剔除后的点云
+    feats_undistort->clear();
+    pcl::copyPointCloud(*cloud_current, *feats_undistort);
+}
+
+// 使用上一帧 tracker 预测得到的全局动态框, 在当前帧局部系下对 feats_undistort 做剔除
+// 仅在 dynamic_filter_mode == 2 时调用, 并在下采样前执行, 保证后续匹配/建图链路一致
+void filterPredictedBoxesOnScan()
+{
+    if (!if_dynamic || dynamic_filter_mode != 2)
+        return;
+
+    if (feats_undistort == nullptr || feats_undistort->empty())
+        return;
+
+    if (dynamBoxBuf.empty())
+        return;
+
+    std::vector<std::vector<double>> dynamic_boxes;
+    while (!dynamBoxBuf.empty())
+    {
+        dynamic_boxes.emplace_back(dynamBoxBuf.front());
+        dynamBoxBuf.pop();
+    }
+
+    if (dynamic_boxes.empty())
+        return;
+
+    box_filter.setNegative(true); // 保留盒子外的点
+
+    PointCloudXYZI::Ptr cloud_current(new PointCloudXYZI);
+    pcl::copyPointCloud(*feats_undistort, *cloud_current);
+
+    Eigen::Affine3f T_ego = trans2Affine3f(transformTobeMapped); // local -> world
+
+    for (const auto &v : dynamic_boxes)
+    {
+        if (v.size() < 8)
+            continue;
+
+        Eigen::Vector3f global_trans(static_cast<float>(v[0]),
+                                     static_cast<float>(v[1]),
+                                     static_cast<float>(v[2]));
+        Eigen::Vector3f local_trans = T_ego.inverse() * global_trans;
+
+        float global_v[6] = {0.0f, 0.0f, static_cast<float>(v[7]),
+                             static_cast<float>(v[0]),
+                             static_cast<float>(v[1]),
+                             static_cast<float>(v[2])};
+        Eigen::Affine3f global_T = trans2Affine3f(global_v);
+        Eigen::Affine3f local_T = T_ego.inverse() * global_T;
+
+        float dx, dy, dz, droll, dpitch, yaw_l;
+        pcl::getTranslationAndEulerAngles(local_T, dx, dy, dz, droll, dpitch, yaw_l);
+
+        double l = v[4];
+        double w = v[5];
+        double h = v[6];
+        double expand_in = 0.1;
+        double expand_out = 0.1;
+
+        box_filter.setMin(Eigen::Vector4f(static_cast<float>(-l / 2.0 - expand_in),
+                                          static_cast<float>(-w / 2.0 - expand_in),
+                                          static_cast<float>(-h / 2.0 - expand_in),
+                                          1.0f));
+        box_filter.setMax(Eigen::Vector4f(static_cast<float>(l / 2.0 + expand_out),
+                                          static_cast<float>(w / 2.0 + expand_out),
+                                          static_cast<float>(h / 2.0 + expand_out),
+                                          1.0f));
+        box_filter.setTranslation(local_trans);
+        box_filter.setRotation(Eigen::Vector3f(0.0f, 0.0f, yaw_l));
+
+        PointCloudXYZI::Ptr cloud_filtered(new PointCloudXYZI);
+        box_filter.setInputCloud(cloud_current);
+        box_filter.filter(*cloud_filtered);
+        cloud_current.swap(cloud_filtered);
+    }
+
+    feats_undistort->clear();
+    pcl::copyPointCloud(*cloud_current, *feats_undistort);
+}
+
+// 在 world 坐标系下, 根据 limot 检测到的动态框剔除点云中对应区域的点
+// 仅作用于传入的临时点云, 不改变内部用于建图/优化的原始点云
+void filterDynamicPointsInWorld(PointCloudXYZI::Ptr &cloud_world)
+{
+    if (dynamic_filter_mode != 2)
+        return;
+
+    if (cloud_world == nullptr || cloud_world->empty())
+        return;
+
+    if (dynamBoxBuf.empty())
+        return;
+
+    // negative=true: 保留 box 之外的点
+    box_filter.setNegative(true);
+
+    // 逐个检测框进行剔除
+    while (!dynamBoxBuf.empty())
+    {
+        std::vector<double> v = dynamBoxBuf.front();
+        dynamBoxBuf.pop();
+
+        // 期望布局: [x, y, z, ?, l, w, h, yaw]
+        if (v.size() < 8)
+            continue;
+
+        double cx = v[0];
+        double cy = v[1];
+        double cz = v[2];
+        double l = v[4];
+        double w = v[5];
+        double h = v[6];
+        double yaw = v[7];
+
+        // 略微扩展盒子, 防止边界残留
+        double l1 = 0.1;
+        double l2 = 0.1;
+
+        box_filter.setMin(Eigen::Vector4f(-l / 2.0 - l1, -w / 2.0 - l1, -h / 2.0 - l1, 1.0f));
+        box_filter.setMax(Eigen::Vector4f(l / 2.0 + l2, w / 2.0 + l2, h / 2.0 + l2, 1.0f));
+        box_filter.setTranslation(Eigen::Vector3f(static_cast<float>(cx),
+                                                  static_cast<float>(cy),
+                                                  static_cast<float>(cz)));
+        box_filter.setRotation(Eigen::Vector3f(0.0f, 0.0f, static_cast<float>(yaw)));
+
+        PointCloudXYZI::Ptr cloud_filtered(new PointCloudXYZI);
+        box_filter.setInputCloud(cloud_world);
+        box_filter.filter(*cloud_filtered);
+
+        cloud_world.swap(cloud_filtered);
+    }
+}
 void publish_frame_world(const ros::Publisher &pubLaserCloudFull)         //    将稠密点云从 imu convert to  world
 {
     if (scan_pub_en)
     {
         PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
         int size = laserCloudFullRes->points.size();
-        PointCloudXYZI::Ptr laserCloudWorld(
-            new PointCloudXYZI(size, 1));
+        PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
 
+        float max_intensity = std::numeric_limits<float>::lowest();
         for (int i = 0; i < size; i++)
         {
-            RGBpointBodyToWorld(&laserCloudFullRes->points[i],
-                                &laserCloudWorld->points[i]);
+            const auto &pt_body = laserCloudFullRes->points[i];
+            RGBpointBodyToWorld(&pt_body, &laserCloudWorld->points[i]);
+            if (pt_body.intensity > max_intensity)
+                max_intensity = pt_body.intensity;
         }
 
+        // 打印当前帧的最大强度值
+        cout << "[scan] max intensity = " << max_intensity << endl;
+
+        // 发布到 world 坐标系（不在这里做动态剔除，统一在后面根据 dynamic_filter_mode 处理）
         sensor_msgs::PointCloud2 laserCloudmsg;
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
         laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
@@ -3688,6 +4224,18 @@ int main(int argc, char **argv)
     nh.param<double>("limot/chgP_chgP", chgP_chgP, 1e-8);
     nh.param<double>("limot/rubostNum", rubostNum, 1.0);
     nh.param<bool>("limot/if_dynamic", if_dynamic, false);
+    nh.param<int>("limot/dynamic_filter_mode", dynamic_filter_mode, 0);
+    nh.param<bool>("limot/saveObjectResult", saveObjectResult, false);
+    nh.param<int>("limot/frontBoxTargetObjectId", frontBoxTargetObjectId, -1);
+    nh.param<int>("limot/frontBoxPublishMaxFrames", frontBoxPublishMaxFrames, 0);
+    nh.param<bool>("limot/frontBoxAccumulateForPcd", frontBoxAccumulateForPcd, false);
+    nh.param<double>("limot/frontBoxAccumulateRandomOffsetXMin", frontBoxAccumulateRandomOffsetXMin, -0.2);
+    nh.param<double>("limot/frontBoxAccumulateRandomOffsetXMax", frontBoxAccumulateRandomOffsetXMax, 0.2);
+    nh.param<double>("limot/frontBoxAccumulateRandomOffsetYMin", frontBoxAccumulateRandomOffsetYMin, -0.3);
+    nh.param<double>("limot/frontBoxAccumulateRandomOffsetYMax", frontBoxAccumulateRandomOffsetYMax, 0.3);
+    nh.param<double>("limot/frontBoxAccumulateRandomOffsetZMin", frontBoxAccumulateRandomOffsetZMin, -0.3);
+    nh.param<double>("limot/frontBoxAccumulateRandomOffsetZMax", frontBoxAccumulateRandomOffsetZMax, 0.3);
+    nh.param<bool>("limot/frontBoxIcpMap", frontBoxIcpMap, false);
     // nh.param<bool>("limot/pubtrackedobjects", pubtrackedobjects, false);
     nh.param<std::string>("limot/sequence", sequence, "09");
     nh.param<float>("limot/vel_threshold", vel_threshold, 1.0);
@@ -3754,6 +4302,17 @@ int main(int argc, char **argv)
     pos_log_dir += "/pos.txt";
     fp = fopen(pos_log_dir.c_str(), "w");
 
+    // 目标跟踪结果输出文件（每帧优化后的目标位姿）
+    std::string object_result_path = root_dir + "/Log/object_tracking.txt";
+    if (saveObjectResult)
+    {
+        objectResultStream.open(object_result_path, std::ios::out);
+        if (!objectResultStream.is_open())
+        {
+            ROS_WARN("Failed to open object tracking result file: %s", object_result_path.c_str());
+        }
+    }
+
     ofstream fout_pre, fout_out, fout_dbg;
     fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), ios::out);
     fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), ios::out);
@@ -3775,6 +4334,7 @@ int main(int argc, char **argv)
     ros::Publisher pubPathUpdate = nh.advertise<nav_msgs::Path>("fast_lio_sam/path_update", 100000);                   //  isam更新后的path
     pubTrackedObjects = nh.advertise<visualization_msgs::MarkerArray>("/tracked_objects", 100);
     pubObjectTrajectories = nh.advertise<visualization_msgs::MarkerArray>("object_trajectories", 100);
+    pubTrackedObjectLocalCloud = nh.advertise<sensor_msgs::PointCloud2>("/tracked_object_local_cloud", 10);
     pubGnssPath = nh.advertise<nav_msgs::Path>("/gnss_path", 100000);
     pubGnssPoseGT = nh.advertise<std_msgs::String>("/mypose_gt", 1000); // 发布GNSS IMU位姿真值（TUM格式）
     pubLaserCloudSurround = nh.advertise<sensor_msgs::PointCloud2>("fast_lio_sam/mapping/keyframe_submap", 1); // 发布局部关键帧map的特征点云
@@ -3860,6 +4420,14 @@ int main(int argc, char **argv)
                 continue;
             }
 
+            // 用当前预测位姿先更新一次 transformTobeMapped, 供下采样前的动态点剔除使用
+            getCurPose(state_point);
+
+            // 模式 1: 用当前帧检测框剔除; 模式 2: 用上一帧 tracker 预测框剔除
+            // 两者都在下采样前执行, 保证后续匹配 / 建图 / 发布使用一致的点云
+            filterAllDetectionBoxesOnScan();
+            filterPredictedBoxesOnScan();
+
             // 检查当前lidar数据时间，与最早lidar数据时间是否足够
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? false : true;
 
@@ -3939,6 +4507,7 @@ int main(int argc, char **argv)
             double t_update_end = omp_get_wtime();
 
             getCurPose(state_point); //   更新transformTobeMapped
+
             /*back end*/
             // 1.计算当前帧与前一帧位姿变换，如果变化太小，不设为关键帧，反之设为关键帧
             // 2.添加激光里程计因子、GPS因子、闭环因子
@@ -3983,7 +4552,34 @@ int main(int argc, char **argv)
                 }
             }
             if (scan_pub_en || pcd_save_en)
-                publish_frame_world(pubLaserCloudFull);        //   发布world系下的点云
+            {
+                // 模式 0 / 1: 直接使用原始发布逻辑 (模式 1 在前面已经对 feats_undistort 做过剔除)
+                // if (dynamic_filter_mode != 2 || dynamBoxBuf.empty())
+                // {
+                    publish_frame_world(pubLaserCloudFull);        //   发布world系下的点云
+                // }
+                // else
+                // {
+                //     // 模式 2: 在 world 系下用动态框剔除后再发布, 不影响内部建图
+                //     PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
+                //     int size = laserCloudFullRes->points.size();
+                //     PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+
+                //     for (int i = 0; i < size; i++)
+                //     {
+                //         RGBpointBodyToWorld(&laserCloudFullRes->points[i],
+                //                             &laserCloudWorld->points[i]);
+                //     }
+
+                //     filterDynamicPointsInWorld(laserCloudWorld);
+
+                //     sensor_msgs::PointCloud2 laserCloudmsg;
+                //     pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
+                //     laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+                //     laserCloudmsg.header.frame_id = "camera_init";
+                //     pubLaserCloudFull.publish(laserCloudmsg);
+                // }
+            }
             if (scan_pub_en && scan_body_pub_en)
                 publish_frame_body(pubLaserCloudFull_body);         //  发布imu系下的点云
 
@@ -4050,8 +4646,12 @@ int main(int argc, char **argv)
         saveMap();
     }
 
+    saveTrackedObjectCloudsIfNeeded(true);
+
     fout_out.close();
     fout_pre.close();
+    if (frontBoxLogStream.is_open())
+        frontBoxLogStream.close();
 
     if (runtime_pos_log)
     {

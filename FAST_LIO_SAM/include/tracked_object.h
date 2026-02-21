@@ -234,6 +234,9 @@ public:
         temp_object.type = latest_object.type;
         temp_object.measure_lwh = latest_object.measure_lwh;
         temp_object.rotation_zyx = latest_object.rotation_zyx;
+        temp_object.detect_local_xyz = latest_object.detect_local_xyz;
+        temp_object.detect_rotation_zyx = latest_object.detect_rotation_zyx;
+        temp_object.has_detect_pose = false;
         temp_object.pose_inimu[2] = latest_object.pose_inimu[2];
         std::vector<double> predict_pos;
         bool status = tracked_object[k].Predict(frames[flow].frame_id, predict_pos);

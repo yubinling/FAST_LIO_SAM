@@ -18,12 +18,15 @@ public:
   int obj_status = -1;
   int type = -1;
   std::vector<float> local_xyz{ 0,0,0 };
+  std::vector<float> detect_local_xyz{ 0,0,0 };   // 原始检测框在 LiDAR 系下的位置
   std::vector<float> rotation_zyx{ 0,0,0 };
+  std::vector<float> detect_rotation_zyx{ 0,0,0 }; // 原始检测框在 LiDAR 系下的姿态
   std::vector<float> measure_lwh{ 0,0,0 };
   float pose_inimu[6] = { 0,0,0,0,0,0 }; //roll pitch yaw x y z
         // last_rot = rot_ang.cast<double>();
   bool dynamic = false;
   bool initialized = false;
+  bool has_detect_pose = false;
   float score = 0;
   std::vector<float> optimize_t{ 0,0,0,0,0,0 };//roll pitch yaw x y z
   std::vector<float> relative_t{ 0,0,0,0,0,0 }; // [rpy, xyz] relative to current frame pose

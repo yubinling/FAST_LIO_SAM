@@ -19,6 +19,32 @@ limot:
   Scorethre: 0.5                        #recommend: 0.5
   if_priorfactor: true
   if_dynamic: true
+  # dynamic_filter_mode: 三种点云剔除模式 (仅在 if_dynamic=true 时有效)
+  #   0: 不剔除 (保持 FAST-LIO-SAM 原始行为)
+  #   1: 每帧开始时, 使用这一帧所有检测框, 直接在输入点云(lidar系)中剔除框内点; 后续建图/发布都用已剔除后的点云
+  #   2: 只剔除动态框; 建图仍用完整点云, 仅在发布 world 系点云时, 在 world 系下剔除动态框对应点
+  dynamic_filter_mode: 0
+  # 指定某个跟踪目标 id 的局部点云累计功能（默认关闭，不影响原有流程）
+  # frontBoxTargetObjectId:
+  #   >=0: 只累计这个 object_id 的目标点云
+  #   -1: 关闭此功能
+  frontBoxTargetObjectId: -1
+  # frontBoxPublishMaxFrames:
+  #   0: 关闭累计
+  #   -1: 一直累计，直到程序退出时再保存 PCD
+  #   >0: 累计到 N 个有效帧后自动保存，并停止继续累计
+  frontBoxPublishMaxFrames: 0
+  # 如果为 true，则把每帧目标局部点云直接累计，并在保存时输出 *_accumulated.pcd
+  frontBoxAccumulateForPcd: false
+  # 每帧累计时加一点随机偏移，避免多帧完全重合
+  frontBoxAccumulateRandomOffsetXMin: -0.2
+  frontBoxAccumulateRandomOffsetXMax: 0.2
+  frontBoxAccumulateRandomOffsetYMin: -0.3
+  frontBoxAccumulateRandomOffsetYMax: 0.3
+  frontBoxAccumulateRandomOffsetZMin: -0.3
+  frontBoxAccumulateRandomOffsetZMax: 0.3
+  # 如果为 true，则将每帧目标局部点云通过 ICP 对齐到累计地图，并在保存时输出 *_icp_map.pcd
+  frontBoxIcpMap: false
 #   pubtrackedobjects
   window_size: 5
   egoP_egoP: 1.0e-6
@@ -62,7 +88,7 @@ publish:
 
 pcd_save:
     pcd_save_en: true
-    interval: -1                 # how many LiDAR frames saved in each pcd file; 
+    interval: 1                 # how many LiDAR frames saved in each pcd file; 
                                  # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
 
 # voxel filter paprams
