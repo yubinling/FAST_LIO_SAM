@@ -1,0 +1,40 @@
+<launch>
+  <arg name="rviz" default="true" />
+  <arg name="cloud_topic" default="/velodyne_points" />
+  <arg name="detect_topic" default="/detect3d" />
+  <arg name="debug_detection_output" default="$(find fast_lio_sam)/detection/debug/fast4_realtime.txt" />
+  <arg name="detection_verbose" default="false" />
+
+  <rosparam command="load" file="$(find fast_lio_sam)/config/velodyne_robosense.yaml" />
+
+  <!--
+    实时检测模式:
+    velodyne_robosense.yaml 里原本有 detect_file_path，会让 LIO 启动时读离线 txt。
+    这里显式置空，让 laserMapping 走已有 topic 分支，订阅 /detect3d。
+  -->
+  <param name="detect_file_path" type="string" value="" />
+
+  <!-- LIO 和实时检测节点订阅同一个点云 topic，保证 timestamp 来自同一帧点云。 -->
+  <param name="common/lid_topic" type="string" value="$(arg cloud_topic)" />
+
+  <param name="feature_extract_enable" type="bool" value="0"/>
+  <param name="point_filter_num" type="int" value="8"/>
+  <param name="max_iteration" type="int" value="3" />
+  <param name="filter_size_surf" type="double" value="0.8" />
+  <param name="filter_size_map" type="double" value="0.8" />
+  <param name="cube_side_length" type="double" value="1000" />
+  <param name="runtime_pos_log_enable" type="bool" value="1" />
+
+  <!-- 这个 node 实际启动 scripts/run_realtime_detection_limot.sh，脚本内部会 activate se-ssd。 -->
+  <node pkg="fast_lio_sam"
+        type="run_realtime_detection_limot.sh"
+        name="realtime_detection_limot"
+        output="screen"
+        args="--cloud_topic $(arg cloud_topic) --detect_topic $(arg detect_topic) --debug_output $(arg debug_detection_output) --verbose $(arg detection_verbose)" />
+
+  <node pkg="fast_lio_sam" type="fastlio_sam_mapping" name="laserMapping" output="screen" />
+
+  <group if="$(arg rviz)">
+    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_lio_sam)/rviz_cfg/loam_livox.rviz" />
+  </group>
+</launch>
