@@ -18,18 +18,25 @@ common:
 #    imu_topic: "/imu"
 limot:
   Scorethre: 0.5                        #recommend: 0.5
-  if_priorfactor: false
-  if_dynamic: false
+  if_priorfactor: true
+  if_dynamic: true
+  # 若为 true: 当跟踪到 publishOffsetDetectSourceId 时，额外发布一个 detect 目标到 external_tracked_object
+  publishOffsetDetect: false
+  publishOffsetDetectSourceId: 2     # 以哪个 tracked object id 作为基准
+  publishOffsetDetectOutputId: 0     # 额外发布目标显示的 id
+  publishOffsetDetectShiftX: -0.4    # 基准目标局部系偏移, x前为正(m)
+  publishOffsetDetectShiftY: -0.5    # 基准目标局部系偏移, y左为正(m)
+  publishOffsetDetectYawDeg: 2.0     # 额外目标 yaw 偏移(度)
   # dynamic_filter_mode: 三种点云剔除模式 (仅在 if_dynamic=true 时有效)
   #   0: 不剔除 (保持 FAST-LIO-SAM 原始行为)
   #   1: 每帧开始时, 使用这一帧所有检测框, 直接在输入点云(lidar系)中剔除框内点; 后续建图/发布都用已剔除后的点云
   #   2: 只剔除动态框; 建图仍用完整点云, 仅在发布 world 系点云时, 在 world 系下剔除动态框对应点
-  dynamic_filter_mode: 1
+  dynamic_filter_mode: 0
   # 指定某个跟踪目标 id 的局部点云累计功能（默认关闭，不影响原有流程）
   # frontBoxTargetObjectId:
   #   >=0: 只累计这个 object_id 的目标点云
   #   -1: 关闭此功能
-  frontBoxTargetObjectId: 1
+  frontBoxTargetObjectId: 0
   # frontBoxPublishMaxFrames:
   #   0: 关闭累计
   #   -1: 一直累计，直到程序退出时再保存 PCD
@@ -38,12 +45,14 @@ limot:
   # 如果为 true，则把每帧目标局部点云直接累计，并在保存时输出 *_accumulated.pcd
   frontBoxAccumulateForPcd: true
   # 每帧累计时加一点随机偏移，避免多帧完全重合
-  frontBoxAccumulateRandomOffsetXMin: 0.4
-  frontBoxAccumulateRandomOffsetXMax: -0.3
-  frontBoxAccumulateRandomOffsetYMin: 0.5
-  frontBoxAccumulateRandomOffsetYMax: -0.4
-  frontBoxAccumulateRandomOffsetZMin: 0.2
-  frontBoxAccumulateRandomOffsetZMax: -0.2
+  frontBoxAccumulateRandomOffsetXMin: 0 #0.4
+  frontBoxAccumulateRandomOffsetXMax: 0 #-0.3
+  frontBoxAccumulateRandomOffsetYMin: 0 #1
+  frontBoxAccumulateRandomOffsetYMax: 0 #-0.4
+  frontBoxAccumulateRandomOffsetZMin: 0 #0  .2
+  frontBoxAccumulateRandomOffsetZMax: 0 #-0.2
+  frontBoxAccumulateRandomYawDegMin: 0 #-10.0  # (deg) random yaw offset range per frame
+  frontBoxAccumulateRandomYawDegMax: 0 #10.0
   # 如果为 true，则将每帧目标局部点云通过 ICP 对齐到累计地图，并在保存时输出 *_icp_map.pcd
   frontBoxIcpMap: true
   # Scorethre: 0.6                        #recommend: 0.5
@@ -57,8 +66,8 @@ limot:
   objP_objP_chgP: 1.0
   chgP_chgP: 1.0e-2
   rubostNum: 1.0 
-  saveObject: true
-  saveObjectResult: true
+  saveObject: false
+  saveObjectResult: false
   saveFramePose: true
   sequence: "04"
   vel_threshold: 1.0
@@ -127,7 +136,7 @@ historyKeyframeFitnessScore: 0.2              # icp threshold, the smaller the b
 loopClosureNoiseScore: 0.01                    # loop closure noise score for factor graph optimization (variance)
 
 # GPS Settings
-use_gnss: false                       # true: add GPS factors
+use_gnss: false                   # true: add GPS factors
 useImuHeadingInitialization: true           # if using GPS data, set to "true"
 useGpsElevation: true                     # if GPS elevation is bad, set to "false"
 gpsCovThreshold: 2.0                        # m^2, threshold for using GPS data

@@ -126,6 +126,9 @@
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
 double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_plot5[MAXN], s_plot6[MAXN], s_plot7[MAXN], s_plot8[MAXN], s_plot9[MAXN], s_plot10[MAXN], s_plot11[MAXN];
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
+double current_mot_tracking_time_ms = 0.0, current_mot_graph_time_ms = 0.0, current_global_graph_time_ms = 0.0, current_backend_graph_time_ms = 0.0;
+double total_mot_tracking_time_ms = 0.0, total_mot_graph_time_ms = 0.0, total_global_graph_time_ms = 0.0, total_backend_graph_time_ms = 0.0;
+int mot_tracking_frame_count = 0, backend_graph_frame_count = 0;
 int kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true, saveObjectResult = false;
 /**************************/
@@ -254,6 +257,8 @@ double frontBoxAccumulateRandomOffsetYMin = -0.3;
 double frontBoxAccumulateRandomOffsetYMax = 0.3;
 double frontBoxAccumulateRandomOffsetZMin = -0.3;
 double frontBoxAccumulateRandomOffsetZMax = 0.3;
+double frontBoxAccumulateRandomYawDegMin = -10.0;
+double frontBoxAccumulateRandomYawDegMax = 10.0;
 bool frontBoxIcpMap = false;
 int frontBoxPublishFrameCount = 0;
 int frontBoxSkipNoDetection = 0;
@@ -300,6 +305,12 @@ double rubostNum;
 bool if_dynamic;
 // bool pubtrackedobjects;
 bool if_priorfactor;
+bool publishOffsetDetect = false;
+int publishOffsetDetectSourceId = 1;
+int publishOffsetDetectOutputId = 2;
+double publishOffsetDetectShiftX = -0.4;   // local x (forward+)
+double publishOffsetDetectShiftY = -0.5;   // local y (left+)
+double publishOffsetDetectYawDeg = 2.0;    // yaw offset in degree
 std::string sequence;
 int laserCloudInfoHandler_size;
 float vel_threshold;
@@ -326,6 +337,7 @@ ros::Publisher pubCloudRegisteredRaw;
 ros::Publisher pubLoopConstraintEdge;
 // ros::Publisher pubTrackObjects;  //发布跟踪物体的边界框
 ros::Publisher pubTrackedObjects;
+ros::Publisher pubExternalTrackedObject;
 ros::Publisher pubObjectTrajectories;
 ros::Publisher pubTrackedObjectLocalCloud;
 ros::Subscriber subDetect;
@@ -1075,6 +1087,7 @@ void visualizeTrackedObjects() {
     cout << "visualizeTrackedObjects called: flow=" << flow << ", current_frame_idx=" << current_frame_idx << ", frames.size()=" << frames.size() << endl;
     
     visualization_msgs::MarkerArray markerArray;
+    visualization_msgs::MarkerArray externalMarkerArray;
     
     // 【重要】先清除所有旧的边界框和标签，避免累积显示
     visualization_msgs::Marker deleteMarker;
@@ -1089,6 +1102,11 @@ void visualizeTrackedObjects() {
     // 清除标签
     deleteMarker.ns = "tracked_labels";
     markerArray.markers.push_back(deleteMarker);
+
+    deleteMarker.ns = "external_detect_boxes";
+    externalMarkerArray.markers.push_back(deleteMarker);
+    deleteMarker.ns = "external_detect_labels";
+    externalMarkerArray.markers.push_back(deleteMarker);
     
     // 标记当前帧所有物体为非活跃
     for (auto& pair : object_trajectories) {
@@ -1140,20 +1158,21 @@ void visualizeTrackedObjects() {
         object_trajectories[object_id].is_active = true;
         object_trajectories[object_id].last_seen = timeLaserInfoStamp;
         
-        // 创建3D边界框
+        // 创建3D边界框，直接用 CUBE 显示实体长方体
         visualization_msgs::Marker marker;
         marker.header.frame_id = odometryFrame;
         marker.header.stamp = timeLaserInfoStamp;
         marker.ns = "tracked_boxes";
         marker.id = marker_id++;
-        marker.type = visualization_msgs::Marker::LINE_LIST;
+        marker.type = visualization_msgs::Marker::CUBE;
         marker.action = visualization_msgs::Marker::ADD;
-        marker.pose.orientation.w = 1.0;
-        marker.scale.x = 0.08;  // 线宽
+        marker.pose.position.x = x;
+        marker.pose.position.y = y;
+        marker.pose.position.z = z;
         marker.color.r = color[0];
         marker.color.g = color[1];
         marker.color.b = color[2];
-        marker.color.a = 0.9;
+        marker.color.a = 0.55;
         
         // 定义边界框的8个顶点（在物体坐标系中）
         std::vector<Eigen::Vector3f> corners(8);
@@ -1182,6 +1201,16 @@ void visualizeTrackedObjects() {
         R = Eigen::AngleAxisf(roll, Eigen::Vector3f::UnitX())
             * Eigen::AngleAxisf(pitch, Eigen::Vector3f::UnitY())
             * Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ());
+
+        Eigen::Quaternionf q_box(R);
+        q_box.normalize();
+        marker.pose.orientation.x = q_box.x();
+        marker.pose.orientation.y = q_box.y();
+        marker.pose.orientation.z = q_box.z();
+        marker.pose.orientation.w = q_box.w();
+        marker.scale.x = l;
+        marker.scale.y = w;
+        marker.scale.z = h;
         
         // 转换顶点到世界坐标系
         std::vector<geometry_msgs::Point> points(8);
@@ -1192,24 +1221,35 @@ void visualizeTrackedObjects() {
             points[j].z = corner_world.z();
         }
         
-        // 添加边界框的12条边
-        // 底面4条边
-        marker.points.push_back(points[0]); marker.points.push_back(points[1]);
-        marker.points.push_back(points[1]); marker.points.push_back(points[2]);
-        marker.points.push_back(points[2]); marker.points.push_back(points[3]);
-        marker.points.push_back(points[3]); marker.points.push_back(points[0]);
-        // 顶面4条边
-        marker.points.push_back(points[4]); marker.points.push_back(points[5]);
-        marker.points.push_back(points[5]); marker.points.push_back(points[6]);
-        marker.points.push_back(points[6]); marker.points.push_back(points[7]);
-        marker.points.push_back(points[7]); marker.points.push_back(points[4]);
-        // 4条竖边
-        marker.points.push_back(points[0]); marker.points.push_back(points[4]);
-        marker.points.push_back(points[1]); marker.points.push_back(points[5]);
-        marker.points.push_back(points[2]); marker.points.push_back(points[6]);
-        marker.points.push_back(points[3]); marker.points.push_back(points[7]);
-        
         markerArray.markers.push_back(marker);
+
+        // 叠加线框边缘，确保四条竖边在任意视角都清楚可见
+        visualization_msgs::Marker edgeMarker;
+        edgeMarker.header.frame_id = odometryFrame;
+        edgeMarker.header.stamp = timeLaserInfoStamp;
+        edgeMarker.ns = "tracked_box_edges";
+        edgeMarker.id = marker_id++;
+        edgeMarker.type = visualization_msgs::Marker::LINE_LIST;
+        edgeMarker.action = visualization_msgs::Marker::ADD;
+        edgeMarker.pose.orientation.w = 1.0;
+        edgeMarker.scale.x = 0.06;
+        edgeMarker.color.r = color[0];
+        edgeMarker.color.g = color[1];
+        edgeMarker.color.b = color[2];
+        edgeMarker.color.a = 1.0;
+        edgeMarker.points.push_back(points[0]); edgeMarker.points.push_back(points[1]);
+        edgeMarker.points.push_back(points[1]); edgeMarker.points.push_back(points[2]);
+        edgeMarker.points.push_back(points[2]); edgeMarker.points.push_back(points[3]);
+        edgeMarker.points.push_back(points[3]); edgeMarker.points.push_back(points[0]);
+        edgeMarker.points.push_back(points[4]); edgeMarker.points.push_back(points[5]);
+        edgeMarker.points.push_back(points[5]); edgeMarker.points.push_back(points[6]);
+        edgeMarker.points.push_back(points[6]); edgeMarker.points.push_back(points[7]);
+        edgeMarker.points.push_back(points[7]); edgeMarker.points.push_back(points[4]);
+        edgeMarker.points.push_back(points[0]); edgeMarker.points.push_back(points[4]);
+        edgeMarker.points.push_back(points[1]); edgeMarker.points.push_back(points[5]);
+        edgeMarker.points.push_back(points[2]); edgeMarker.points.push_back(points[6]);
+        edgeMarker.points.push_back(points[3]); edgeMarker.points.push_back(points[7]);
+        markerArray.markers.push_back(edgeMarker);
         
         // 添加物体ID文本标签
         visualization_msgs::Marker textMarker;
@@ -1237,6 +1277,61 @@ void visualizeTrackedObjects() {
         textMarker.text = ss.str();
         
         markerArray.markers.push_back(textMarker);
+
+        if (publishOffsetDetect && object_id == publishOffsetDetectSourceId) {
+            Eigen::Vector3f offset_local(
+                static_cast<float>(publishOffsetDetectShiftX),
+                static_cast<float>(publishOffsetDetectShiftY),
+                0.0f);
+            Eigen::Vector3f center_world(x, y, z);
+            Eigen::Vector3f center_offset = center_world + R * offset_local;
+            const float yaw_offset_rad = static_cast<float>(publishOffsetDetectYawDeg) * static_cast<float>(M_PI) / 180.0f;
+            Eigen::Matrix3f R_offset = R * Eigen::AngleAxisf(yaw_offset_rad, Eigen::Vector3f::UnitZ()).toRotationMatrix();
+
+            visualization_msgs::Marker detectMarker;
+            detectMarker.header.frame_id = odometryFrame;
+            detectMarker.header.stamp = timeLaserInfoStamp;
+            detectMarker.ns = "external_detect_boxes";
+            detectMarker.id = publishOffsetDetectOutputId;
+            detectMarker.type = visualization_msgs::Marker::CUBE;
+            detectMarker.action = visualization_msgs::Marker::ADD;
+            detectMarker.pose.position.x = center_offset.x();
+            detectMarker.pose.position.y = center_offset.y();
+            detectMarker.pose.position.z = center_offset.z();
+            Eigen::Quaternionf q_offset(R_offset);
+            q_offset.normalize();
+            detectMarker.pose.orientation.x = q_offset.x();
+            detectMarker.pose.orientation.y = q_offset.y();
+            detectMarker.pose.orientation.z = q_offset.z();
+            detectMarker.pose.orientation.w = q_offset.w();
+            detectMarker.scale.x = l;
+            detectMarker.scale.y = w;
+            detectMarker.scale.z = h;
+            detectMarker.color.r = 1.0;
+            detectMarker.color.g = 0.2;
+            detectMarker.color.b = 0.2;
+            detectMarker.color.a = 0.35;
+            externalMarkerArray.markers.push_back(detectMarker);
+
+            visualization_msgs::Marker detectText;
+            detectText.header.frame_id = odometryFrame;
+            detectText.header.stamp = timeLaserInfoStamp;
+            detectText.ns = "external_detect_labels";
+            detectText.id = publishOffsetDetectOutputId;
+            detectText.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+            detectText.action = visualization_msgs::Marker::ADD;
+            detectText.pose.position.x = center_offset.x();
+            detectText.pose.position.y = center_offset.y();
+            detectText.pose.position.z = center_offset.z() + h / 2 + 0.8;
+            detectText.pose.orientation.w = 1.0;
+            detectText.scale.z = 0.6;
+            detectText.color.r = 1.0;
+            detectText.color.g = 1.0;
+            detectText.color.b = 1.0;
+            detectText.color.a = 1.0;
+            detectText.text = std::string("ID:") + std::to_string(publishOffsetDetectOutputId);
+            externalMarkerArray.markers.push_back(detectText);
+        }
     }
     
     // 打印统计信息
@@ -1248,6 +1343,7 @@ void visualizeTrackedObjects() {
     
     // 发布边界框（即使为空也发布，以清除旧的marker）
     pubTrackedObjects.publish(markerArray);
+    pubExternalTrackedObject.publish(externalMarkerArray);
     cout << "Published " << markerArray.markers.size() << " markers to /limot/tracked_objects" << endl;
     
     // 可视化所有物体的轨迹
@@ -1635,6 +1731,11 @@ bool setFrame() {
 
 void saveKeyFramesAndFactor()
 {
+    current_mot_tracking_time_ms = 0.0;
+    current_mot_graph_time_ms = 0.0;
+    current_global_graph_time_ms = 0.0;
+    current_backend_graph_time_ms = 0.0;
+
     if (if_dynamic){
         setFrame();//这一帧的object和flow
         // 当前帧在 body/world 下的位姿
@@ -1660,9 +1761,14 @@ void saveKeyFramesAndFactor()
             Affine3ftovec6f(global_t, frames[flow].objects[n].optimize_t);
          }
             // 2. Start tracking
+            double mot_tracking_start = omp_get_wtime();
             tracker.AssociateObjects(frames, flow, vel_threshold, dynamBoxBuf);
+            current_mot_tracking_time_ms = (omp_get_wtime() - mot_tracking_start) * 1000.0;
+            total_mot_tracking_time_ms += current_mot_tracking_time_ms;
+            mot_tracking_frame_count++;
 
             // 3. Add factors
+            double mot_graph_start = omp_get_wtime();
             // 3.1 Add LiDAR odometry factors
             frames[flow].vertex_local_id = local_graph.key_id;
             if (flow == 0) {
@@ -1876,6 +1982,7 @@ void saveKeyFramesAndFactor()
 
 
             graph_temp = local_graph.gtSAMgraph2;
+            current_mot_graph_time_ms = (omp_get_wtime() - mot_graph_start) * 1000.0;
 
 
 
@@ -1887,6 +1994,7 @@ void saveKeyFramesAndFactor()
         PointTypePose currentPose6D = trans2PointTypePose(transformTobeMapped);
         currentPose6D.time = lidar_end_time;
         recordIntermediateFrameForMap(currentPose6D);
+        current_backend_graph_time_ms = current_mot_graph_time_ms + current_global_graph_time_ms;
 
         // 局部因子图优化后，不更新自身姿态，保持原来的ESKF状态
         // if (if_dynamic){
@@ -1914,6 +2022,7 @@ void saveKeyFramesAndFactor()
         return;
     }
     // 激光里程计因子(from fast-lio),  输入的是frame_relative pose  帧间位姿(body 系下)
+    double global_graph_start = omp_get_wtime();
     addOdomFactor();
     // GPS因子 (UTM -> WGS84)
     if (use_gnss){
@@ -2008,6 +2117,8 @@ void saveKeyFramesAndFactor()
             frames[flow].vertex_local_id, latestEstimate, robustGlobalPoseNoise));
         local_graph.f_id++;
     }
+    current_global_graph_time_ms = (omp_get_wtime() - global_graph_start) * 1000.0;
+    current_backend_graph_time_ms = current_mot_graph_time_ms + current_global_graph_time_ms;
      
     // TODO:  P的修正有待考察，按照yanliangwang的做法，修改了p，会跑飞
     // esekfom::esekf<state_ikfom, 12, input_ikfom>::cov P_updated = kf.get_P(); // 获取当前的状态估计的协方差矩阵
@@ -2802,19 +2913,28 @@ void accumulateTrackedObjectCloud()
         if (!frontBoxAccumulatedCloud)
             frontBoxAccumulatedCloud.reset(new PointCloudXYZI());
 
-        std::uniform_real_distribution<float> dist_x(frontBoxAccumulateRandomOffsetXMin, frontBoxAccumulateRandomOffsetXMax);
-        std::uniform_real_distribution<float> dist_y(frontBoxAccumulateRandomOffsetYMin, frontBoxAccumulateRandomOffsetYMax);
-        std::uniform_real_distribution<float> dist_z(frontBoxAccumulateRandomOffsetZMin, frontBoxAccumulateRandomOffsetZMax);
-        const float dx = dist_x(rng);
-        const float dy = dist_y(rng);
-        const float dz = dist_z(rng);
+        auto sample_between = [&rng](double a, double b) -> float {
+            const double lo = std::min(a, b);
+            const double hi = std::max(a, b);
+            std::uniform_real_distribution<float> dist(static_cast<float>(lo), static_cast<float>(hi));
+            return dist(rng);
+        };
+
+        const float dx = sample_between(frontBoxAccumulateRandomOffsetXMin, frontBoxAccumulateRandomOffsetXMax);
+        const float dy = sample_between(frontBoxAccumulateRandomOffsetYMin, frontBoxAccumulateRandomOffsetYMax);
+        const float dz = sample_between(frontBoxAccumulateRandomOffsetZMin, frontBoxAccumulateRandomOffsetZMax);
+        const float yaw_offset_deg = sample_between(frontBoxAccumulateRandomYawDegMin, frontBoxAccumulateRandomYawDegMax);
+        const float yaw_offset_rad = yaw_offset_deg * static_cast<float>(M_PI) / 180.0f;
+        const Eigen::Matrix3f random_rot =
+            Eigen::AngleAxisf(yaw_offset_rad, Eigen::Vector3f::UnitZ()).toRotationMatrix();
 
         for (const auto &pt : cloudLocal->points)
         {
             PointType p = pt;
-            p.x += dx;
-            p.y += dy;
-            p.z += dz;
+            const Eigen::Vector3f rotated = random_rot * Eigen::Vector3f(pt.x, pt.y, pt.z);
+            p.x = rotated.x() + dx;
+            p.y = rotated.y() + dy;
+            p.z = rotated.z() + dz;
             frontBoxAccumulatedCloud->push_back(p);
         }
     }
@@ -4482,6 +4602,12 @@ int main(int argc, char **argv)
     nh.param<double>("limot/chgP_chgP", chgP_chgP, 1e-8);
     nh.param<double>("limot/rubostNum", rubostNum, 1.0);
     nh.param<bool>("limot/if_dynamic", if_dynamic, false);
+    nh.param<bool>("limot/publishOffsetDetect", publishOffsetDetect, false);
+    nh.param<int>("limot/publishOffsetDetectSourceId", publishOffsetDetectSourceId, 1);
+    nh.param<int>("limot/publishOffsetDetectOutputId", publishOffsetDetectOutputId, 2);
+    nh.param<double>("limot/publishOffsetDetectShiftX", publishOffsetDetectShiftX, -0.4);
+    nh.param<double>("limot/publishOffsetDetectShiftY", publishOffsetDetectShiftY, -0.5);
+    nh.param<double>("limot/publishOffsetDetectYawDeg", publishOffsetDetectYawDeg, 2.0);
     nh.param<int>("limot/dynamic_filter_mode", dynamic_filter_mode, 0);
     nh.param<bool>("limot/saveObjectResult", saveObjectResult, false);
     nh.param<int>("limot/frontBoxTargetObjectId", frontBoxTargetObjectId, -1);
@@ -4493,6 +4619,8 @@ int main(int argc, char **argv)
     nh.param<double>("limot/frontBoxAccumulateRandomOffsetYMax", frontBoxAccumulateRandomOffsetYMax, 0.3);
     nh.param<double>("limot/frontBoxAccumulateRandomOffsetZMin", frontBoxAccumulateRandomOffsetZMin, -0.3);
     nh.param<double>("limot/frontBoxAccumulateRandomOffsetZMax", frontBoxAccumulateRandomOffsetZMax, 0.3);
+    nh.param<double>("limot/frontBoxAccumulateRandomYawDegMin", frontBoxAccumulateRandomYawDegMin, -10.0);
+    nh.param<double>("limot/frontBoxAccumulateRandomYawDegMax", frontBoxAccumulateRandomYawDegMax, 10.0);
     nh.param<bool>("limot/frontBoxIcpMap", frontBoxIcpMap, false);
     // nh.param<bool>("limot/pubtrackedobjects", pubtrackedobjects, false);
     nh.param<std::string>("limot/sequence", sequence, "09");
@@ -4595,6 +4723,7 @@ int main(int argc, char **argv)
     ros::Publisher pubPath = nh.advertise<nav_msgs::Path>("/path", 1e00000);
     ros::Publisher pubPathUpdate = nh.advertise<nav_msgs::Path>("fast_lio_sam/path_update", 100000);                   //  isam更新后的path
     pubTrackedObjects = nh.advertise<visualization_msgs::MarkerArray>("/tracked_objects", 100);
+    pubExternalTrackedObject = nh.advertise<visualization_msgs::MarkerArray>("external_tracked_object", 100);
     pubObjectTrajectories = nh.advertise<visualization_msgs::MarkerArray>("object_trajectories", 100);
     pubTrackedObjectLocalCloud = nh.advertise<sensor_msgs::PointCloud2>("/tracked_object_local_cloud", 10);
     pubGnssPath = nh.advertise<nav_msgs::Path>("/gnss_path", 100000);
@@ -4794,13 +4923,14 @@ int main(int argc, char **argv)
             double backend_opt_time_ms     = (t3 - t_update_end) * 1000.0;                 // saveKeyFramesAndFactor + correctPoses + 发布里程计
             double kdtree_incremental_ms   = (t5 - t3) * 1000.0;                 // 点云加入 ikdtree
             double total_frame_time_ms     = (t5 - t0) * 1000.0;                 // 整帧总时间
-
-            ROS_INFO_STREAM("[TIME] frame=" << frame_num
-                            << " imu_pre+downsample(ms)=" << imu_propagate_time_ms
-                            << " ekf_update(ms)=" << ekf_update_time_ms
-                            << " backend_opt(ms)=" << backend_opt_time_ms
-                            << " kdtree_update(ms)=" << kdtree_incremental_ms
-                            << " total(ms)=" << total_frame_time_ms);
+            total_mot_graph_time_ms += current_mot_graph_time_ms;
+            total_global_graph_time_ms += current_global_graph_time_ms;
+            total_backend_graph_time_ms += current_backend_graph_time_ms;
+            backend_graph_frame_count++;
+            double avg_mot_tracking_time_ms = mot_tracking_frame_count > 0 ? (total_mot_tracking_time_ms / mot_tracking_frame_count) : 0.0;
+            double avg_mot_graph_time_ms = backend_graph_frame_count > 0 ? (total_mot_graph_time_ms / backend_graph_frame_count) : 0.0;
+            double avg_global_graph_time_ms = backend_graph_frame_count > 0 ? (total_global_graph_time_ms / backend_graph_frame_count) : 0.0;
+            double avg_backend_graph_time_ms = backend_graph_frame_count > 0 ? (total_backend_graph_time_ms / backend_graph_frame_count) : 0.0;
             /******* Publish points *******/
             if (path_en){
                 publish_path(pubPath);
@@ -4877,7 +5007,9 @@ int main(int argc, char **argv)
                 s_plot9[time_log_counter] = aver_time_consu;
                 s_plot10[time_log_counter] = add_point_size;
                 time_log_counter++;
-                printf("[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f \n", t1 - t0, aver_time_match, aver_time_solve, t3 - t1, t5 - t3, aver_time_consu, aver_time_icp, aver_time_const_H_time);
+                printf("[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f ave backend_graph(ms): %0.6f ave mot_graph(ms): %0.6f ave global_graph(ms): %0.6f ave mot_track(ms): %0.6f \n",
+                       t1 - t0, aver_time_match, aver_time_solve, t3 - t1, t5 - t3, aver_time_consu, aver_time_icp, aver_time_const_H_time,
+                       avg_backend_graph_time_ms, avg_mot_graph_time_ms, avg_global_graph_time_ms, avg_mot_tracking_time_ms);
                 ext_euler = SO3ToEuler(state_point.offset_R_L_I);
                 fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << state_point.pos.transpose() << " " << ext_euler.transpose() << " " << state_point.offset_T_L_I.transpose() << " " << state_point.vel.transpose()
                          << " " << state_point.bg.transpose() << " " << state_point.ba.transpose() << " " << state_point.grav << " " << feats_undistort->points.size() << endl;

@@ -37,7 +37,7 @@ Panels:
   - Class: rviz/Time
     Name: Time
     SyncMode: 0
-    SyncSource: ""
+    SyncSource: currPoints
 Preferences:
   PromptSaveOnExit: true
 Toolbars:
@@ -115,7 +115,7 @@ Visualization Manager:
           Color Transformer: Intensity
           Decay Time: 1000
           Enabled: true
-          Invert Rainbow: true
+          Invert Rainbow: false
           Max Color: 255; 255; 255
           Min Color: 0; 0; 0
           Name: currPoints
@@ -201,18 +201,18 @@ Visualization Manager:
       Name: Odometry
     - Alpha: 1
       Class: rviz/Axes
-      Enabled: true
+      Enabled: false
       Length: 0.699999988079071
       Name: Axes
       Radius: 0.10000000149011612
       Reference Frame: <Fixed Frame>
       Show Trail: false
-      Value: true
+      Value: false
     - Alpha: 0
       Buffer Length: 2
       Class: rviz/Path
       Color: 25; 255; 255
-      Enabled: true
+      Enabled: false
       Head Diameter: 0
       Head Length: 0
       Length: 0.30000001192092896
@@ -231,12 +231,12 @@ Visualization Manager:
       Shaft Length: 0.4000000059604645
       Topic: /path
       Unreliable: false
-      Value: true
+      Value: false
     - Alpha: 1
       Buffer Length: 1
       Class: rviz/Path
       Color: 239; 41; 41
-      Enabled: true
+      Enabled: false
       Head Diameter: 0.30000001192092896
       Head Length: 0.20000000298023224
       Length: 0.30000001192092896
@@ -255,12 +255,12 @@ Visualization Manager:
       Shaft Length: 0.10000000149011612
       Topic: /fast_lio_sam/path_update
       Unreliable: false
-      Value: true
+      Value: false
     - Alpha: 1
       Buffer Length: 1
       Class: rviz/Path
       Color: 138; 226; 52
-      Enabled: true
+      Enabled: false
       Head Diameter: 0.30000001192092896
       Head Length: 0.20000000298023224
       Length: 0.30000001192092896
@@ -279,7 +279,7 @@ Visualization Manager:
       Shaft Length: 0.10000000149011612
       Topic: /gnss_path
       Unreliable: false
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: false
       Autocompute Value Bounds:
@@ -351,7 +351,8 @@ Visualization Manager:
       Marker Topic: /tracked_objects
       Name: MarkerArray
       Namespaces:
-        {}
+        tracked_boxes: true
+        tracked_labels: true
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -359,7 +360,8 @@ Visualization Manager:
       Marker Topic: /object_trajectories
       Name: MarkerArray
       Namespaces:
-        {}
+        object_trajectories: true
+        trajectory_points: true
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -511,4 +513,4 @@ Window Geometry:
     collapsed: true
   Width: 1389
   X: 258
-  Y: 138
+  Y: 101
