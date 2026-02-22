@@ -1,1 +1,5 @@
 # Keep the bundled model files visible in this package.
+*_frozen.pb
+*.onnx
+*.engine
+*.plan

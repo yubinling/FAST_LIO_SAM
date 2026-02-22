@@ -52,3 +52,27 @@ FAST_LIO_SAM/detection/debug/fast4_realtime.txt
 
 Compare that file with the existing `fast4.txt` detection file to check output
 compatibility.
+
+## TensorRT Preparation
+
+The first TensorRT preparation step is exporting the TF1 checkpoint to a frozen
+graph:
+
+```bash
+FAST_LIO_SAM/scripts/run_realtime_detection_limot.sh \
+  --help
+
+cd FAST_LIO_SAM/detection/livox_detection
+conda run -n se-ssd python export_frozen_graph.py
+```
+
+The exported graph uses stable tensor names:
+
+```text
+input:  input_bev_img:0
+output: feature_out:0
+```
+
+The current `se-ssd` environment has TensorFlow 1.15, but does not yet include
+`onnx`, `tf2onnx`, or `tensorrt`. Those are needed for the next conversion step
+from frozen graph/ONNX to TensorRT engine.
