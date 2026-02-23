@@ -76,3 +76,36 @@ output: feature_out:0
 The current `se-ssd` environment has TensorFlow 1.15, but does not yet include
 `onnx`, `tf2onnx`, or `tensorrt`. Those are needed for the next conversion step
 from frozen graph/ONNX to TensorRT engine.
+
+## TensorRT 实时运行
+
+生成并验证 `model/livoxmodel_fp32.engine` 之后，可以用 TensorRT 后端启动实时检测：
+
+```bash
+roslaunch fast_lio_sam mapping_robosense_realtime_detection.launch \
+  detection_backend:=trt
+```
+
+这里只替换网络前向推理，`lib_cpp.cal_result` 后处理和 `/detect3d` 消息格式仍然和 TensorFlow
+后端保持一致。
+
+TensorRT Python 后端需要 `se-ssd` 环境里有 `tensorrt`，并且能找到
+`/usr/local/TensorRT-8.5.3.1` 下的 TensorRT/CUDA 运行库。GPU 内存拷贝直接调用
+`libcudart`，不依赖 `pycuda`。
+
+在同一段 bag 上对比 TensorFlow 和 TensorRT：
+
+```bash
+cd FAST_LIO_SAM/detection/livox_detection
+TENSORRT_DIR=/usr/local/TensorRT-8.5.3.1 \
+LD_LIBRARY_PATH=$TENSORRT_DIR/targets/x86_64-linux-gnu/lib:$LD_LIBRARY_PATH \
+conda run -n se-ssd python compare_detection_backends.py \
+  --bag /home/lingyubin/Documents/lyb/bag/satslam_realcar_Data/fast4_withcar.bag \
+  --topic /velodyne_points \
+  --engine model/livoxmodel_fp32.engine \
+  --limit 10
+```
+
+当前 FP32 engine 在 `fast4_withcar.bag` 前 10 帧上验证通过：检测框数量一致，
+`summary_detection_shape_mismatch=0`，最大检测框数值差异约为 `0.000858`。之前测试过的
+FP16 engine 会出现 `inf` 输出，不建议作为默认运行路径。

@@ -9,6 +9,11 @@ DETECTION_DIR="$PACKAGE_DIR/detection/livox_detection"
 source "$HOME/anaconda3/etc/profile.d/conda.sh"
 conda activate se-ssd
 
+# TensorRT 运行库安装在 conda 环境外；TRT 后端启动前需要把库路径补进来。
+export TENSORRT_DIR="${TENSORRT_DIR:-/usr/local/TensorRT-8.5.3.1}"
+export PATH="$TENSORRT_DIR/bin:$PATH"
+export LD_LIBRARY_PATH="$TENSORRT_DIR/targets/x86_64-linux-gnu/lib:${LD_LIBRARY_PATH:-}"
+
 cd "$DETECTION_DIR"
 
 # 用 exec 让 ROS 直接管理 Python 检测进程，Ctrl+C/roslaunch 退出时信号能正确传递。

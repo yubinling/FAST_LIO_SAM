@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 import argparse
+import ctypes
+import ctypes.util
 import os
 import sys
 import time
@@ -14,13 +16,11 @@ if SCRIPT_DIR not in sys.path:
 import numpy as np
 import rospy
 import sensor_msgs.point_cloud2 as pcl2
-import tensorflow as tf
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Float64MultiArray
 
 import config.config as cfg
 import lib_cpp
-from networks.model import livox_model
 
 
 DX = cfg.VOXEL_SIZE[0]
@@ -48,6 +48,127 @@ T1 = np.array([[0.0, -1.0, 0.0, 0.0],
 TYPE_INDICES = {'car': 0, 'bus': 1, 'truck': 2, 'pedestrian': 3, 'bimo': 4}
 
 
+class TrtRunner(object):
+    def __init__(self, engine_path):
+        try:
+            import tensorrt as trt
+        except ImportError as exc:
+            raise RuntimeError(
+                "TensorRT backend requires tensorrt in the se-ssd environment."
+            ) from exc
+
+        if not os.path.isfile(engine_path):
+            raise RuntimeError("TensorRT engine not found: {}".format(engine_path))
+
+        self.trt = trt
+        self.cudart = self.load_cudart()
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        with open(engine_path, "rb") as engine_file:
+            runtime = trt.Runtime(self.logger)
+            self.engine = runtime.deserialize_cuda_engine(engine_file.read())
+        if self.engine is None:
+            raise RuntimeError("Failed to deserialize TensorRT engine: {}".format(engine_path))
+
+        self.context = self.engine.create_execution_context()
+        self.bindings = [None] * self.engine.num_bindings
+        self.input_index = None
+        self.output_index = None
+        self.host_inputs = {}
+        self.device_inputs = {}
+        self.host_outputs = {}
+        self.device_outputs = {}
+        self.device_allocations = []
+
+        # engine 是固定 batch/固定 shape，这里提前为输入输出 binding 分配 host/GPU 内存。
+        for index in range(self.engine.num_bindings):
+            shape = tuple(self.engine.get_binding_shape(index))
+            dtype = trt.nptype(self.engine.get_binding_dtype(index))
+            size = trt.volume(shape)
+            host_mem = np.empty(size, dtype=dtype)
+            device_mem = self.cuda_malloc(host_mem.nbytes)
+            self.device_allocations.append(device_mem)
+            self.bindings[index] = int(device_mem.value)
+            if self.engine.binding_is_input(index):
+                self.input_index = index
+                self.input_shape = shape
+                self.host_inputs[index] = host_mem
+                self.device_inputs[index] = device_mem
+            else:
+                self.output_index = index
+                self.output_shape = shape
+                self.host_outputs[index] = host_mem
+                self.device_outputs[index] = device_mem
+
+        if self.input_index is None or self.output_index is None:
+            raise RuntimeError("TensorRT engine must have one input and one output")
+
+    def load_cudart(self):
+        # 直接通过 CUDA runtime 做显存申请和拷贝，避免额外引入 pycuda 依赖。
+        lib_name = ctypes.util.find_library("cudart") or "libcudart.so"
+        cudart = ctypes.CDLL(lib_name)
+        cudart.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+        cudart.cudaMalloc.restype = ctypes.c_int
+        cudart.cudaFree.argtypes = [ctypes.c_void_p]
+        cudart.cudaFree.restype = ctypes.c_int
+        cudart.cudaMemcpy.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+        ]
+        cudart.cudaMemcpy.restype = ctypes.c_int
+        return cudart
+
+    def check_cuda(self, status, action):
+        if status != 0:
+            raise RuntimeError("CUDA runtime call failed during {}: status {}".format(action, status))
+
+    def cuda_malloc(self, nbytes):
+        ptr = ctypes.c_void_p()
+        self.check_cuda(self.cudart.cudaMalloc(ctypes.byref(ptr), nbytes), "cudaMalloc")
+        return ptr
+
+    def cuda_memcpy_htod(self, device_ptr, host_array):
+        host_array = np.ascontiguousarray(host_array)
+        self.check_cuda(
+            self.cudart.cudaMemcpy(
+                device_ptr,
+                host_array.ctypes.data_as(ctypes.c_void_p),
+                host_array.nbytes,
+                1),
+            "cudaMemcpy host-to-device")
+
+    def cuda_memcpy_dtoh(self, host_array, device_ptr):
+        self.check_cuda(
+            self.cudart.cudaMemcpy(
+                host_array.ctypes.data_as(ctypes.c_void_p),
+                device_ptr,
+                host_array.nbytes,
+                2),
+            "cudaMemcpy device-to-host")
+
+    def close(self):
+        for ptr in self.device_allocations:
+            if ptr:
+                self.cudart.cudaFree(ptr)
+        self.device_allocations = []
+
+    def infer(self, batch_bev_img):
+        if tuple(batch_bev_img.shape) != tuple(self.input_shape):
+            raise RuntimeError(
+                "Unexpected TensorRT input shape: got {}, expected {}".format(
+                    batch_bev_img.shape, self.input_shape))
+
+        host_input = self.host_inputs[self.input_index]
+        # 输入从 numpy 拷到 GPU，执行 TRT engine 后再把 feature_out 拷回 CPU 交给 C++ 后处理。
+        np.copyto(host_input, np.ascontiguousarray(batch_bev_img).ravel())
+        self.cuda_memcpy_htod(self.device_inputs[self.input_index], host_input)
+        self.context.execute_v2(bindings=self.bindings)
+        host_output = self.host_outputs[self.output_index]
+        self.cuda_memcpy_dtoh(host_output, self.device_outputs[self.output_index])
+        return np.array(host_output).reshape(self.output_shape)
+
+
 class RealtimeDetector(object):
     def __init__(self, args):
         self.args = args
@@ -55,7 +176,7 @@ class RealtimeDetector(object):
         self.debug_file = None
 
         if args.debug_output:
-            # debug txt 只用于和离线 detectmsg/*.txt 对齐检查；LIO 实时输入仍然是 /detect3d。
+            # 调试 txt 只用于和离线 detectmsg/*.txt 对齐检查；LIO 实时输入仍然是 /detect3d。
             debug_dir = os.path.dirname(os.path.abspath(args.debug_output))
             if debug_dir and not os.path.isdir(debug_dir):
                 os.makedirs(debug_dir)
@@ -67,25 +188,37 @@ class RealtimeDetector(object):
             self.debug_file.write("# Coordinates: jsk frame (same as ros_limot.py output)\n")
             self.debug_file.flush()
 
-        rospy.loginfo("Loading LivoxDetection TensorFlow model from %s", cfg.MODEL_PATH)
-        self.net = livox_model(HEIGHT, WIDTH, CHANNELS)
-        with tf.Graph().as_default():
-            with tf.device('/gpu:' + str(cfg.GPU_INDEX)):
-                input_bev_img_pl = self.net.placeholder_inputs(cfg.BATCH_SIZE)
-                end_points = self.net.get_model(input_bev_img_pl)
+        self.trt_runner = None
+        self.sess = None
+        self.ops = None
+        if args.backend == "trt":
+            # TensorRT 只替换网络前向推理；后处理和 /detect3d 消息格式继续复用 TensorFlow 路径。
+            rospy.loginfo("Loading LivoxDetection TensorRT engine from %s", args.engine_path)
+            self.trt_runner = TrtRunner(args.engine_path)
+            rospy.loginfo("LivoxDetection TensorRT engine loaded")
+        else:
+            import tensorflow as tf
+            from networks.model import livox_model
 
-                saver = tf.train.Saver()
-                config = tf.ConfigProto()
-                config.gpu_options.allow_growth = True
-                config.allow_soft_placement = True
-                config.log_device_placement = False
-                self.sess = tf.Session(config=config)
-                saver.restore(self.sess, cfg.MODEL_PATH)
-                self.ops = {
-                    'input_bev_img_pl': input_bev_img_pl,
-                    'end_points': end_points,
-                }
-        rospy.loginfo("LivoxDetection model loaded")
+            rospy.loginfo("Loading LivoxDetection TensorFlow model from %s", cfg.MODEL_PATH)
+            self.net = livox_model(HEIGHT, WIDTH, CHANNELS)
+            with tf.Graph().as_default():
+                with tf.device('/gpu:' + str(cfg.GPU_INDEX)):
+                    input_bev_img_pl = self.net.placeholder_inputs(cfg.BATCH_SIZE)
+                    end_points = self.net.get_model(input_bev_img_pl)
+
+                    saver = tf.train.Saver()
+                    config = tf.ConfigProto()
+                    config.gpu_options.allow_growth = True
+                    config.allow_soft_placement = True
+                    config.log_device_placement = False
+                    self.sess = tf.Session(config=config)
+                    saver.restore(self.sess, cfg.MODEL_PATH)
+                    self.ops = {
+                        'input_bev_img_pl': input_bev_img_pl,
+                        'end_points': end_points,
+                    }
+            rospy.loginfo("LivoxDetection TensorFlow model loaded")
 
         self.pub = rospy.Publisher(args.detect_topic, Float64MultiArray, queue_size=args.queue_size)
         self.sub = rospy.Subscriber(args.cloud_topic, PointCloud2, self.cloud_callback,
@@ -96,6 +229,8 @@ class RealtimeDetector(object):
     def close(self):
         if self.debug_file is not None:
             self.debug_file.close()
+        if self.trt_runner is not None:
+            self.trt_runner.close()
 
     def roty(self, t):
         c = np.cos(t)
@@ -138,9 +273,12 @@ class RealtimeDetector(object):
         return np.reshape(data, (HEIGHT, WIDTH, CHANNELS)).astype(np.float32)
 
     def detect(self, batch_bev_img):
-        feed_dict = {self.ops['input_bev_img_pl']: batch_bev_img}
-        feature_out, = self.sess.run([self.ops['end_points']['feature_out']],
-                                     feed_dict=feed_dict)
+        if self.trt_runner is not None:
+            feature_out = self.trt_runner.infer(batch_bev_img)
+        else:
+            feed_dict = {self.ops['input_bev_img_pl']: batch_bev_img}
+            feature_out, = self.sess.run([self.ops['end_points']['feature_out']],
+                                         feed_dict=feed_dict)
         result = lib_cpp.cal_result(
             feature_out[0, :, :, :],
             cfg.BOX_THRESHOLD,
@@ -268,7 +406,7 @@ class RealtimeDetector(object):
             boxes = self.detect(voxel)
 
         msg = self.boxes_to_msg(timestamp, boxes)
-        # 这是 LIO 真正消费的实时检测结果；debug txt 只是旁路记录。
+        # 这是 LIO 真正消费的实时检测结果；调试 txt 只是旁路记录。
         self.pub.publish(msg)
         self.write_debug_line(msg)
 
@@ -296,6 +434,8 @@ def parse_args():
     parser.add_argument("--debug_output", default="")
     parser.add_argument("--queue_size", type=int, default=10)
     parser.add_argument("--verbose", nargs="?", const=True, default=False, type=str2bool)
+    parser.add_argument("--backend", choices=("tf", "trt"), default="tf")
+    parser.add_argument("--engine_path", default=os.path.join(SCRIPT_DIR, "model", "livoxmodel.engine"))
     return parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
 
 

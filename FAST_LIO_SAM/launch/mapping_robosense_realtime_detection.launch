@@ -4,6 +4,8 @@
   <arg name="detect_topic" default="/detect3d" />
   <arg name="debug_detection_output" default="$(find fast_lio_sam)/detection/debug/fast4_realtime.txt" />
   <arg name="detection_verbose" default="false" />
+  <arg name="detection_backend" default="tf" />
+  <arg name="detection_engine" default="$(find fast_lio_sam)/detection/livox_detection/model/livoxmodel_fp32.engine" />
 
   <rosparam command="load" file="$(find fast_lio_sam)/config/velodyne_robosense.yaml" />
 
@@ -30,7 +32,7 @@
         type="run_realtime_detection_limot.sh"
         name="realtime_detection_limot"
         output="screen"
-        args="--cloud_topic $(arg cloud_topic) --detect_topic $(arg detect_topic) --debug_output $(arg debug_detection_output) --verbose $(arg detection_verbose)" />
+        args="--cloud_topic $(arg cloud_topic) --detect_topic $(arg detect_topic) --debug_output $(arg debug_detection_output) --verbose $(arg detection_verbose) --backend $(arg detection_backend) --engine_path $(arg detection_engine)" />
 
   <node pkg="fast_lio_sam" type="fastlio_sam_mapping" name="laserMapping" output="screen" />
 
