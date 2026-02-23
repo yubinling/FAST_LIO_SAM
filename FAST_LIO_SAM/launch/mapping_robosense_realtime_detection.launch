@@ -1,4 +1,14 @@
 <launch>
+  <!--
+    实时检测启动方式:
+    1. 普通 TensorFlow 网络检测:
+       roslaunch fast_lio_sam mapping_robosense_realtime_detection.launch
+    2. TensorRT 加速检测:
+       roslaunch fast_lio_sam mapping_robosense_realtime_detection.launch detection_backend:=trt
+       如果仍然看到检测结果晚到，可以临时加大等待:
+       roslaunch fast_lio_sam mapping_robosense_realtime_detection.launch detection_backend:=trt detection_wait_ms:=500
+  -->
+
   <arg name="rviz" default="true" />
   <arg name="cloud_topic" default="/velodyne_points" />
   <arg name="detect_topic" default="/detect3d" />
@@ -6,6 +16,7 @@
   <arg name="detection_verbose" default="false" />
   <arg name="detection_backend" default="tf" />
   <arg name="detection_engine" default="$(find fast_lio_sam)/detection/livox_detection/model/livoxmodel_fp32.engine" />
+  <arg name="detection_wait_ms" default="300" />
 
   <rosparam command="load" file="$(find fast_lio_sam)/config/velodyne_robosense.yaml" />
 
@@ -26,6 +37,8 @@
   <param name="filter_size_map" type="double" value="0.8" />
   <param name="cube_side_length" type="double" value="1000" />
   <param name="runtime_pos_log_enable" type="bool" value="1" />
+  <!-- TRT/TF 实时检测会比点云回调晚到；LIO 在这里最多等待对应检测结果多少毫秒。 -->
+  <param name="limot/detection_wait_ms" type="int" value="$(arg detection_wait_ms)" />
 
   <!-- 这个 node 实际启动 scripts/run_realtime_detection_limot.sh，脚本内部会 activate se-ssd。 -->
   <node pkg="fast_lio_sam"

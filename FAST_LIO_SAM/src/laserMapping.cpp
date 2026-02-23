@@ -315,6 +315,7 @@ std::string sequence;
 int laserCloudInfoHandler_size;
 float vel_threshold;
 float Scorethre;
+int detection_wait_ms = 60; // 实时检测等待时间，TRT 首帧/预热可能比普通网络更慢
 
 Eigen::Vector3d last_pos;
 Eigen::Vector3d last_rot;//roll pitch yaw
@@ -1563,46 +1564,45 @@ bool setFrame() {
     double timeLaserInfoCur = lidar_start_time;
     cout << "decQueue.size()" << decQueue.size() << endl;
     const double TIMESTAMP_TOLERANCE = 0.001; // 时间戳匹配容差：0.001秒
+    const int MAX_DETECTION_WAIT_MS = std::max(0, detection_wait_ms);
     
-    // 查找时间戳最接近当前雷达帧的检测数据
-    while (!decQueue.empty()) // 更新到最新的时间戳，或者更新为空
-    {
-        std_msgs::Float64MultiArray thisDec = decQueue.front();
-        // 如果检测时间戳比雷达时间戳早超过容差，跳过该检测数据
-        if (thisDec.data[0] - timeLaserInfoCur < (-1) * TIMESTAMP_TOLERANCE) {
-            ROS_WARN_STREAM("Skipping detection with timestamp " << std::fixed << std::setprecision(8) << thisDec.data[0] 
-                            << " (too early, current lidar: " << std::fixed << std::setprecision(8) << timeLaserInfoCur << ")");
-            decQueue.pop_front();
-            if (decQueue.empty()) break;
-            continue;
-        }
-        // 如果时间戳差距在容差范围内，使用该检测数据
-        if (abs(thisDec.data[0] - timeLaserInfoCur) < TIMESTAMP_TOLERANCE) {
-            // cout << "do not wait, detect3d has already come" << endl;
+    // 查找当前雷达帧对应的检测结果。TRT/TF 实时检测有计算延迟，
+    // 所以不能只在队列为空时等待；队首不是当前帧时也要短暂等待新检测到达。
+    int wait_ms = 0;
+    while (wait_ms < MAX_DETECTION_WAIT_MS) {
+        bool need_wait = decQueue.empty();
+        while (!decQueue.empty()) {
+            std_msgs::Float64MultiArray thisDec = decQueue.front();
+            double timeDiffSigned = thisDec.data[0] - timeLaserInfoCur;
+
+            if (timeDiffSigned < (-1) * TIMESTAMP_TOLERANCE) {
+                ROS_WARN_STREAM("Skipping detection with timestamp " << std::fixed << std::setprecision(8) << thisDec.data[0]
+                                << " (too early, current lidar: " << std::fixed << std::setprecision(8) << timeLaserInfoCur << ")");
+                decQueue.pop_front();
+                need_wait = decQueue.empty();
+                continue;
+            }
+
+            if (std::abs(timeDiffSigned) < TIMESTAMP_TOLERANCE) {
+                need_wait = false;
+                break;
+            }
+
+            // 队首检测比当前雷达帧更晚，可能是当前帧检测还没到；先等一下，不立刻判失败。
+            need_wait = true;
             break;
         }
-        // 如果检测时间戳比雷达时间戳晚超过容差，等待（不跳过，因为可能后续会有匹配的）
-        break;
-    }
-    while (decQueue.empty()) // 如果空的话就等待。
-    {
-        static int j = 0;
-        sleep(0.001);
-        j++;
-        if (j == 60) {
-            cout << "Waiting for test results more than " << j << "ms, no more waiting!" << endl;
-            LidarSLAMFrame frame;
-            frame.frame_id = flow;
-            frame.objects.clear();
-            frames.push_back(frame);
-            j = 0;
-            return false;
+
+        if (!need_wait) {
+            break;
         }
+
+        ros::Duration(0.001).sleep();
+        wait_ms++;
     }
-    
-    // 检查是否有可用的检测数据
+
     if (decQueue.empty()) {
-        ROS_WARN_STREAM("No detection data available for lidar timestamp " << timeLaserInfoCur);
+        cout << "Waiting for test results more than " << MAX_DETECTION_WAIT_MS << "ms, no more waiting!" << endl;
         LidarSLAMFrame frame;
         frame.frame_id = flow;
         frame.objects.clear();
@@ -4592,6 +4592,7 @@ int main(int argc, char **argv)
 
         // limot
     nh.param<float>("limot/Scorethre", Scorethre, 0.5);
+    nh.param<int>("limot/detection_wait_ms", detection_wait_ms, 60);
     nh.param<int>("limot/laserCloudInfoHandler_size", laserCloudInfoHandler_size, 10);
     nh.param<bool>("limot/if_priorfactor", if_priorfactor, true);
     nh.param<int>("limot/window_size", window_size, 10);
