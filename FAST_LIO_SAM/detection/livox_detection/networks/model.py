@@ -24,7 +24,10 @@ class livox_model():
 
     def placeholder_inputs(self, batch_size):
 
-        input_bev_img_pl = tf.placeholder(tf.bool,
+        # Use float32 input for ONNX/TensorRT compatibility. The voxel values are
+        # still binary 0/1, so this keeps the TensorFlow output equivalent to the
+        # original bool input followed by tf.cast(..., float32).
+        input_bev_img_pl = tf.placeholder(tf.float32,
                                           shape=(batch_size, self.img_height, self.img_width, self.channels))
 
         return input_bev_img_pl
@@ -52,7 +55,7 @@ class livox_model():
             with slim.arg_scope([slim.conv2d],padding='SAME',
                     #normalizer_fn = slim.batch_norm,
                     ):
-                # bev_input = input_bev_img_pl 把二进制转换为float
+                # Keep this cast so old checkpoints and float32 TensorRT export share the same graph body.
                 bev_input = tf.cast(input_bev_img_pl,dtype=tf.float32)
                 print (bev_input.shape) #(batch,448,224,1)
                 img_conv1 = slim.conv2d(bev_input,64,[3,3])

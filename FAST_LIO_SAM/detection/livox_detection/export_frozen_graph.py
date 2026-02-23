@@ -49,8 +49,10 @@ def main():
     graph = tf.Graph()
     with graph.as_default():
         net = livox_model(HEIGHT, WIDTH, CHANNELS)
+        # TensorRT handles float inputs reliably. The realtime detector feeds a
+        # binary 0/1 voxel grid as float32, preserving the original network math.
         input_bev_img = tf.placeholder(
-            tf.bool,
+            tf.float32,
             shape=(cfg.BATCH_SIZE, HEIGHT, WIDTH, CHANNELS),
             name="input_bev_img")
         end_points = net.get_model(input_bev_img)
@@ -72,7 +74,7 @@ def main():
                 output_file.write(frozen.SerializeToString())
 
     print("Exported frozen graph: {}".format(os.path.abspath(args.output)))
-    print("Input tensor: input_bev_img:0")
+    print("Input tensor: input_bev_img:0 dtype=float32")
     print("Output tensor: feature_out:0")
 
 

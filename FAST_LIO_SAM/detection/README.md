@@ -69,7 +69,7 @@ conda run -n se-ssd python export_frozen_graph.py
 The exported graph uses stable tensor names:
 
 ```text
-input:  input_bev_img:0
+input:  input_bev_img:0  dtype=float32  shape=[1, 1008, 224, 30]
 output: feature_out:0
 ```
 

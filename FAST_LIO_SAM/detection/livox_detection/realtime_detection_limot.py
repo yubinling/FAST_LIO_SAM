@@ -135,7 +135,7 @@ class RealtimeDetector(object):
                     pixel_x = int((-x + OVERLAP) / DX)
                     pixel_y = int((y + Y_MAX) / DY)
                     data[pixel_x * WIDTH * CHANNELS + pixel_y * CHANNELS + channel] = 1
-        return np.reshape(data, (HEIGHT, WIDTH, CHANNELS))
+        return np.reshape(data, (HEIGHT, WIDTH, CHANNELS)).astype(np.float32)
 
     def detect(self, batch_bev_img):
         feed_dict = {self.ops['input_bev_img_pl']: batch_bev_img}
