@@ -1562,46 +1562,55 @@ void addGPSFactor()
 
 bool setFrame() {
     double timeLaserInfoCur = lidar_start_time;
-    cout << "decQueue.size()" << decQueue.size() << endl;
+    {
+        std::lock_guard<std::mutex> lock(decLock);
+        cout << "decQueue.size()" << decQueue.size() << endl;
+    }
     const double TIMESTAMP_TOLERANCE = 0.001; // 时间戳匹配容差：0.001秒
     const int MAX_DETECTION_WAIT_MS = std::max(0, detection_wait_ms);
+    std_msgs::Float64MultiArray thisDec;
+    bool hasMatchedDetection = false;
     
     // 查找当前雷达帧对应的检测结果。TRT/TF 实时检测有计算延迟，
-    // 所以不能只在队列为空时等待；队首不是当前帧时也要短暂等待新检测到达。
+    // 主循环是单线程 spinOnce 模式，因此等待期间也要主动 spinOnce 让 /detect3d 回调入队。
     int wait_ms = 0;
     while (wait_ms < MAX_DETECTION_WAIT_MS) {
-        bool need_wait = decQueue.empty();
-        while (!decQueue.empty()) {
-            std_msgs::Float64MultiArray thisDec = decQueue.front();
-            double timeDiffSigned = thisDec.data[0] - timeLaserInfoCur;
+        bool need_wait = true;
+        {
+            std::lock_guard<std::mutex> lock(decLock);
+            while (!decQueue.empty()) {
+                std_msgs::Float64MultiArray candidateDec = decQueue.front();
+                double timeDiffSigned = candidateDec.data[0] - timeLaserInfoCur;
 
-            if (timeDiffSigned < (-1) * TIMESTAMP_TOLERANCE) {
-                ROS_WARN_STREAM("Skipping detection with timestamp " << std::fixed << std::setprecision(8) << thisDec.data[0]
-                                << " (too early, current lidar: " << std::fixed << std::setprecision(8) << timeLaserInfoCur << ")");
-                decQueue.pop_front();
-                need_wait = decQueue.empty();
-                continue;
-            }
+                if (timeDiffSigned < (-1) * TIMESTAMP_TOLERANCE) {
+                    ROS_WARN_STREAM("Skipping detection with timestamp " << std::fixed << std::setprecision(8) << candidateDec.data[0]
+                                    << " (too early, current lidar: " << std::fixed << std::setprecision(8) << timeLaserInfoCur << ")");
+                    decQueue.pop_front();
+                    continue;
+                }
 
-            if (std::abs(timeDiffSigned) < TIMESTAMP_TOLERANCE) {
-                need_wait = false;
+                if (std::abs(timeDiffSigned) < TIMESTAMP_TOLERANCE) {
+                    thisDec = candidateDec;
+                    hasMatchedDetection = true;
+                    need_wait = false;
+                    break;
+                }
+
+                // 队首检测比当前雷达帧更晚，可能是当前帧检测还没到；先等一下，不立刻判失败。
                 break;
             }
-
-            // 队首检测比当前雷达帧更晚，可能是当前帧检测还没到；先等一下，不立刻判失败。
-            need_wait = true;
-            break;
         }
 
         if (!need_wait) {
             break;
         }
 
+        ros::spinOnce();
         ros::Duration(0.001).sleep();
         wait_ms++;
     }
 
-    if (decQueue.empty()) {
+    if (!hasMatchedDetection) {
         cout << "Waiting for test results more than " << MAX_DETECTION_WAIT_MS << "ms, no more waiting!" << endl;
         LidarSLAMFrame frame;
         frame.frame_id = flow;
@@ -1609,9 +1618,6 @@ bool setFrame() {
         frames.push_back(frame);
         return false;
     }
-    
-    // 等到了检测结果：
-    std_msgs::Float64MultiArray thisDec = decQueue.front();
     
     // 最终检查时间戳是否匹配（必须在0.001秒以内）
     double timeDiff = abs(thisDec.data[0] - timeLaserInfoCur);
@@ -1626,6 +1632,7 @@ bool setFrame() {
         frames.push_back(frame);
         // 如果检测数据太早，移除它；如果太晚，保留等待下一帧
         if (thisDec.data[0] < timeLaserInfoCur) {
+            std::lock_guard<std::mutex> lock(decLock);
             decQueue.pop_front();
         }
         return false;
@@ -1720,6 +1727,7 @@ bool setFrame() {
         
         frame.objects = objects;
         frames.push_back(frame);
+        std::lock_guard<std::mutex> lock(decLock);
         decQueue.pop_front();
         return true;
     }
