@@ -109,3 +109,26 @@ conda run -n se-ssd python compare_detection_backends.py \
 当前 FP32 engine 在 `fast4_withcar.bag` 前 10 帧上验证通过：检测框数量一致，
 `summary_detection_shape_mismatch=0`，最大检测框数值差异约为 `0.000858`。之前测试过的
 FP16 engine 会出现 `inf` 输出，不建议作为默认运行路径。
+
+## 离线生成 txt
+
+不启动 LIO、只从 bag 生成检测 txt，可以直接使用当前包里的离线脚本：
+
+```bash
+FAST_LIO_SAM/scripts/run_offline_detection_limot.sh \
+  --bag /home/lingyubin/Documents/lyb/bag/satslam_realcar_Data/fast4_withcar.bag \
+  --topic /velodyne_points \
+  --output /home/lingyubin/Documents/lyb/livo/sat-slam/src/FAST_LIO_SAM/FAST_LIO_SAM/detectmsg/fast4.txt \
+  --backend trt \
+  --verbose
+```
+
+生成的 txt 格式和 LIO 的 `detect_file_path` 读取格式一致：
+
+```text
+[timestamp, type, x, y, z, l, w, h, yaw, score, ...]
+```
+
+`--backend tf` 使用 TensorFlow checkpoint，`--backend trt` 使用
+`model/livoxmodel_fp32.engine`。TRT 模式不会主动加载 TensorFlow，适合快速预生成 txt。
+可以加 `--limit 10` 只处理前 10 帧做测试。
