@@ -16,7 +16,7 @@ if SCRIPT_DIR not in sys.path:
 import numpy as np
 import rospy
 import sensor_msgs.point_cloud2 as pcl2
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Float64MultiArray
 
 import config.config as cfg
@@ -195,6 +195,8 @@ class RealtimeDetector(object):
             # TensorRT 只替换网络前向推理；后处理和 /detect3d 消息格式继续复用 TensorFlow 路径。
             rospy.loginfo("Loading LivoxDetection TensorRT engine from %s", args.engine_path)
             self.trt_runner = TrtRunner(args.engine_path)
+            # 预热一次 TRT engine，避免第一帧真实点云承担 CUDA/context 首次推理开销。
+            self.trt_runner.infer(np.zeros(self.trt_runner.input_shape, dtype=np.float32))
             rospy.loginfo("LivoxDetection TensorRT engine loaded")
         else:
             import tensorflow as tf
@@ -252,25 +254,45 @@ class RealtimeDetector(object):
         return np.transpose(corners_3d)
 
     def data2voxel(self, pclist):
-        data = [0 for _ in range(HEIGHT * WIDTH * CHANNELS)]
+        data = np.zeros(HEIGHT * WIDTH * CHANNELS, dtype=np.float32)
+        points = np.asarray(pclist)
+        if points.size == 0:
+            return data.reshape((HEIGHT, WIDTH, CHANNELS))
 
-        for line in pclist:
-            x = float(line[0])
-            y = float(line[1])
-            z = float(line[2])
-            if y > Y_MIN and y < Y_MAX and x > X_MIN and x < X_MAX and z > Z_MIN and z < Z_MAX:
-                channel = int((-z + Z_MAX) / DZ)
-                if abs(x) < 3 and abs(y) < 3:
-                    continue
-                if x > -OVERLAP:
-                    pixel_x = int((x - X_MIN + 2 * OVERLAP) / DX)
-                    pixel_y = int((-y + Y_MAX) / DY)
-                    data[pixel_x * WIDTH * CHANNELS + pixel_y * CHANNELS + channel] = 1
-                if x < OVERLAP:
-                    pixel_x = int((-x + OVERLAP) / DX)
-                    pixel_y = int((y + Y_MAX) / DY)
-                    data[pixel_x * WIDTH * CHANNELS + pixel_y * CHANNELS + channel] = 1
-        return np.reshape(data, (HEIGHT, WIDTH, CHANNELS)).astype(np.float32)
+        x = points[:, 0]
+        y = points[:, 1]
+        z = points[:, 2]
+
+        # 与原始逐点循环保持相同过滤条件，只把索引计算改成 numpy 批量处理。
+        valid = (
+            (y > Y_MIN) & (y < Y_MAX) &
+            (x > X_MIN) & (x < X_MAX) &
+            (z > Z_MIN) & (z < Z_MAX) &
+            ~((np.abs(x) < 3.0) & (np.abs(y) < 3.0))
+        )
+        if not np.any(valid):
+            return data.reshape((HEIGHT, WIDTH, CHANNELS))
+
+        x = x[valid]
+        y = y[valid]
+        z = z[valid]
+        channel = ((-z + Z_MAX) / DZ).astype(np.int32)
+
+        front_mask = x > -OVERLAP
+        if np.any(front_mask):
+            pixel_x = ((x[front_mask] - X_MIN + 2 * OVERLAP) / DX).astype(np.int32)
+            pixel_y = ((-y[front_mask] + Y_MAX) / DY).astype(np.int32)
+            index = pixel_x * WIDTH * CHANNELS + pixel_y * CHANNELS + channel[front_mask]
+            data[index] = 1.0
+
+        back_mask = x < OVERLAP
+        if np.any(back_mask):
+            pixel_x = ((-x[back_mask] + OVERLAP) / DX).astype(np.int32)
+            pixel_y = ((y[back_mask] + Y_MAX) / DY).astype(np.int32)
+            index = pixel_x * WIDTH * CHANNELS + pixel_y * CHANNELS + channel[back_mask]
+            data[index] = 1.0
+
+        return data.reshape((HEIGHT, WIDTH, CHANNELS))
 
     def detect(self, batch_bev_img):
         if self.trt_runner is not None:
@@ -343,6 +365,63 @@ class RealtimeDetector(object):
         return boxes
 
     def read_points(self, cloud_msg):
+        type_map = {
+            PointField.INT8: np.int8,
+            PointField.UINT8: np.uint8,
+            PointField.INT16: np.int16,
+            PointField.UINT16: np.uint16,
+            PointField.INT32: np.int32,
+            PointField.UINT32: np.uint32,
+            PointField.FLOAT32: np.float32,
+            PointField.FLOAT64: np.float64,
+        }
+        field_map = {field.name: field for field in cloud_msg.fields}
+        required_fields = ("x", "y", "z")
+        try:
+            if all(name in field_map for name in required_fields):
+                names = []
+                formats = []
+                offsets = []
+                byte_order = ">" if cloud_msg.is_bigendian else "<"
+                for name in ("x", "y", "z", "intensity"):
+                    if name not in field_map:
+                        continue
+                    field = field_map[name]
+                    if field.datatype not in type_map or field.count != 1:
+                        raise ValueError("unsupported PointCloud2 field")
+                    names.append(name)
+                    formats.append(np.dtype(type_map[field.datatype]).newbyteorder(byte_order))
+                    offsets.append(field.offset)
+
+                dtype = np.dtype({
+                    "names": names,
+                    "formats": formats,
+                    "offsets": offsets,
+                    "itemsize": cloud_msg.point_step,
+                })
+                point_count = cloud_msg.width * cloud_msg.height
+                cloud_arr = np.frombuffer(cloud_msg.data, dtype=dtype, count=point_count)
+
+                x = cloud_arr["x"].astype(np.float64, copy=False)
+                y = cloud_arr["y"].astype(np.float64, copy=False)
+                z = cloud_arr["z"].astype(np.float64, copy=False)
+                finite_mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+                valid_mask = (
+                    finite_mask &
+                    ~((x == 0.0) & (y == 0.0) & (z == 0.0)) &
+                    ~((np.abs(x) < 2.0) & (np.abs(y) < 1.5))
+                )
+                if "intensity" in cloud_arr.dtype.names:
+                    intensity = cloud_arr["intensity"].astype(np.float64, copy=False)
+                    valid_mask = valid_mask & np.isfinite(intensity)
+                else:
+                    intensity = np.zeros(point_count, dtype=np.float64)
+
+                # 返回 float64 是为了保持和原来 pcl2.read_points -> Python float 的索引计算一致。
+                return np.column_stack((x[valid_mask], y[valid_mask], z[valid_mask], intensity[valid_mask]))
+        except Exception:
+            pass
+
         points = []
         try:
             iterator = pcl2.read_points(cloud_msg, skip_nans=True,
