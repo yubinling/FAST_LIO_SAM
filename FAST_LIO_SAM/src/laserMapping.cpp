@@ -38,6 +38,7 @@
 #include <thread>
 #include <fstream>
 #include <csignal>
+#include <limits>
 #include <unistd.h>
 #include <Python.h>
 #include <so3_math.h>
@@ -316,6 +317,12 @@ int laserCloudInfoHandler_size;
 float vel_threshold;
 float Scorethre;
 int detection_wait_ms = 60; // 实时检测等待时间，TRT 首帧/预热可能比普通网络更慢
+bool associationDescriptorGateEnable = false;
+double associationDescriptorCosThreshold = 0.55;
+int associationDescriptorGridX = 4;
+int associationDescriptorGridY = 4;
+int associationDescriptorMinPointsPerCell = 2;
+int associationDescriptorMinValidCells = 3;
 
 Eigen::Vector3d last_pos;
 Eigen::Vector3d last_rot;//roll pitch yaw
@@ -1560,6 +1567,73 @@ void addGPSFactor()
     }
 }
 
+bool computeAssociationHeightDescriptor(const Eigen::Vector3f &center_lidar,
+                                        const Eigen::Vector3f &measure_lwh,
+                                        float yaw_lidar,
+                                        std::vector<float> &descriptor)
+{
+    descriptor.clear();
+    if (!associationDescriptorGateEnable)
+        return false;
+    if (feats_undistort == nullptr || feats_undistort->empty())
+        return false;
+    if (associationDescriptorGridX <= 0 || associationDescriptorGridY <= 0)
+        return false;
+
+    const float half_l = 0.5f * measure_lwh.x();
+    const float half_w = 0.5f * measure_lwh.y();
+    const float half_h = 0.5f * measure_lwh.z();
+    if (half_l <= 0.0f || half_w <= 0.0f || half_h <= 0.0f)
+        return false;
+
+    const int cell_num = associationDescriptorGridX * associationDescriptorGridY;
+    std::vector<int> point_count(cell_num, 0);
+    std::vector<float> max_height(cell_num, -std::numeric_limits<float>::max());
+    Eigen::Matrix3f R_lidar =
+        Eigen::AngleAxisf(yaw_lidar, Eigen::Vector3f::UnitZ()).toRotationMatrix();
+
+    for (const auto &pt : feats_undistort->points)
+    {
+        Eigen::Vector3f p_lidar(pt.x, pt.y, pt.z);
+        Eigen::Vector3f p_local = R_lidar.transpose() * (p_lidar - center_lidar);
+        if (std::fabs(p_local.x()) > half_l ||
+            std::fabs(p_local.y()) > half_w ||
+            std::fabs(p_local.z()) > half_h)
+            continue;
+
+        float u = (p_local.x() + half_l) / (2.0f * half_l);
+        float v = (p_local.y() + half_w) / (2.0f * half_w);
+        int ix = static_cast<int>(u * associationDescriptorGridX);
+        int iy = static_cast<int>(v * associationDescriptorGridY);
+        ix = std::max(0, std::min(associationDescriptorGridX - 1, ix));
+        iy = std::max(0, std::min(associationDescriptorGridY - 1, iy));
+        int cell_idx = iy * associationDescriptorGridX + ix;
+
+        point_count[cell_idx]++;
+        // 将局部 z 平移到 [0, h] 后再归一化，描述车体高度分布而不是绝对高度。
+        float normalized_height = (p_local.z() + half_h) / (2.0f * half_h);
+        max_height[cell_idx] = std::max(max_height[cell_idx], normalized_height);
+    }
+
+    descriptor.assign(cell_num, 0.0f);
+    int valid_cells = 0;
+    for (int i = 0; i < cell_num; ++i)
+    {
+        if (point_count[i] >= associationDescriptorMinPointsPerCell)
+        {
+            descriptor[i] = max_height[i];
+            valid_cells++;
+        }
+    }
+
+    if (valid_cells < associationDescriptorMinValidCells)
+    {
+        descriptor.clear();
+        return false;
+    }
+    return true;
+}
+
 bool setFrame() {
     double timeLaserInfoCur = lidar_start_time;
     {
@@ -1690,6 +1764,12 @@ bool setFrame() {
                 ob.measure_lwh[i] = measure_lwh(i);
             }
             ob.has_detect_pose = true;
+            // 宽松误关联检测使用的局部高度描述子；默认参数关闭时不会做额外点云遍历。
+            ob.has_height_descriptor = computeAssociationHeightDescriptor(
+                local_xyz,
+                measure_lwh,
+                rotation_zyx[0],
+                ob.height_descriptor);
             // Eigen::Affine3f local_t = Eigen::Affine3f::Identity();
             // local_t = pcl::getTransformation(local_xyz[0], local_xyz[1], local_xyz[2], 0, 0, rotation_zyx[0]);
             // ob.pose_inimu[0] = local_t.rotation().eulerAngles(0, 1, 2)[0];
@@ -1770,7 +1850,9 @@ void saveKeyFramesAndFactor()
          }
             // 2. Start tracking
             double mot_tracking_start = omp_get_wtime();
-            tracker.AssociateObjects(frames, flow, vel_threshold, dynamBoxBuf);
+            tracker.AssociateObjects(frames, flow, vel_threshold, dynamBoxBuf,
+                                     associationDescriptorGateEnable,
+                                     associationDescriptorCosThreshold);
             current_mot_tracking_time_ms = (omp_get_wtime() - mot_tracking_start) * 1000.0;
             total_mot_tracking_time_ms += current_mot_tracking_time_ms;
             mot_tracking_frame_count++;
@@ -4601,6 +4683,12 @@ int main(int argc, char **argv)
         // limot
     nh.param<float>("limot/Scorethre", Scorethre, 0.5);
     nh.param<int>("limot/detection_wait_ms", detection_wait_ms, 60);
+    nh.param<bool>("limot/association_descriptor_gate_enable", associationDescriptorGateEnable, false);
+    nh.param<double>("limot/association_descriptor_cos_threshold", associationDescriptorCosThreshold, 0.55);
+    nh.param<int>("limot/association_descriptor_grid_x", associationDescriptorGridX, 4);
+    nh.param<int>("limot/association_descriptor_grid_y", associationDescriptorGridY, 4);
+    nh.param<int>("limot/association_descriptor_min_points_per_cell", associationDescriptorMinPointsPerCell, 2);
+    nh.param<int>("limot/association_descriptor_min_valid_cells", associationDescriptorMinValidCells, 3);
     nh.param<int>("limot/laserCloudInfoHandler_size", laserCloudInfoHandler_size, 10);
     nh.param<bool>("limot/if_priorfactor", if_priorfactor, true);
     nh.param<int>("limot/window_size", window_size, 10);

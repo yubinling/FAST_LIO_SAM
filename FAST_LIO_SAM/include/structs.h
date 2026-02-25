@@ -31,6 +31,8 @@ public:
   std::vector<float> optimize_t{ 0,0,0,0,0,0 };//roll pitch yaw x y z
   std::vector<float> relative_t{ 0,0,0,0,0,0 }; // [rpy, xyz] relative to current frame pose
   bool has_relative_pose = false; // 是否有相对位姿
+  std::vector<float> height_descriptor; // 目标局部高度描述子，用于宽松误关联检测
+  bool has_height_descriptor = false; // 描述子有效时才参与关联二次校验
   std::vector<float> v_t{ 0,0,0,0,0,0 };
   double velocity = 0;
   int vertex_id = -1;
@@ -91,4 +93,3 @@ struct OneFrame {
   int64_t timestamp;
   std::vector<LidarPoint> frame_data;
 };
-

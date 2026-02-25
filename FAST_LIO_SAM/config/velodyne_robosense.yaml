@@ -18,6 +18,13 @@ common:
 #    imu_topic: "/imu"
 limot:
   Scorethre: 0.5                        #recommend: 0.5
+  # 宽松版误关联检测：默认关闭；打开后只对成熟轨迹做局部高度描述子二次校验
+  association_descriptor_gate_enable: false
+  association_descriptor_cos_threshold: 0.55
+  association_descriptor_grid_x: 4
+  association_descriptor_grid_y: 4
+  association_descriptor_min_points_per_cell: 2
+  association_descriptor_min_valid_cells: 3
   if_priorfactor: true
   if_dynamic: true
   # 若为 true: 当跟踪到 publishOffsetDetectSourceId 时，额外发布一个 detect 目标到 external_tracked_object
@@ -181,4 +188,3 @@ saveMapRecordIntermediateFrames: true
 saveMapIntermediateFrameAnchorMode: 0
 # 保存地图时，是否把这些非关键帧也一并展开到全局地图
 saveMapIncludeIntermediateFramesInGlobalMap: true
-

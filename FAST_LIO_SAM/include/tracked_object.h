@@ -2,6 +2,7 @@
 #include <structs.h>
 #include <curve_fit_gtsam.h>
 #include <successive_shortest_path.h>
+#include <cmath>
 #include <utility>
 void DataAssociationBySSP(std::vector<std::vector<double>> _matrix, std::vector<int>& _order, std::vector<int>& _reverse_order) {
   std::unordered_map<int, int> direct_assignment;
@@ -28,6 +29,8 @@ private:
 public:
   std::vector<double> track_utm_x;
   std::vector<double> track_utm_y;
+  std::vector<float> height_descriptor;
+  bool has_height_descriptor = false;
   int missed;
   int num_observations;
   std::pair<int, int> last_obs;
@@ -70,6 +73,21 @@ public:
       y_t_fit.Fitting(
         std::vector<double>(track_time.end() - num, track_time.end()),
         std::vector<double>(track_utm_y.end() - num, track_utm_y.end()));
+    }
+
+    // 只用真实检测目标更新历史描述子；预测补帧没有描述子时不改变历史模型。
+    if (object.has_height_descriptor && !object.height_descriptor.empty()) {
+      if (!has_height_descriptor || height_descriptor.size() != object.height_descriptor.size()) {
+        height_descriptor = object.height_descriptor;
+        has_height_descriptor = true;
+      }
+      else {
+        const float history_weight = 0.8f;
+        const float current_weight = 1.0f - history_weight;
+        for (size_t i = 0; i < height_descriptor.size(); ++i) {
+          height_descriptor[i] = history_weight * height_descriptor[i] + current_weight * object.height_descriptor[i];
+        }
+      }
     }
   };
 
@@ -116,6 +134,22 @@ private:
   std::vector<TrackedObstacle> tracked_object;
   int id;
 
+  double DescriptorCosineSimilarity(const std::vector<float>& a, const std::vector<float>& b) {
+    if (a.empty() || a.size() != b.size())
+      return -1.0;
+    double dot = 0.0;
+    double norm_a = 0.0;
+    double norm_b = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+      dot += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+      norm_a += static_cast<double>(a[i]) * static_cast<double>(a[i]);
+      norm_b += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+    }
+    if (norm_a < 1e-6 || norm_b < 1e-6)
+      return -1.0;
+    return dot / (std::sqrt(norm_a) * std::sqrt(norm_b));
+  }
+
 public:
   Tracker() { id = 0; }
 
@@ -128,7 +162,8 @@ public:
     }
   }
 
-  void AssociateObjects(std::vector<LidarSLAMFrame, Eigen::aligned_allocator<LidarSLAMFrame>>& frames, int flow, float vel_threshold, std::queue<std::vector<double>>& dynamBoxBuf) {
+  void AssociateObjects(std::vector<LidarSLAMFrame, Eigen::aligned_allocator<LidarSLAMFrame>>& frames, int flow, float vel_threshold, std::queue<std::vector<double>>& dynamBoxBuf,
+                        bool descriptor_gate_enable = false, double descriptor_cos_threshold = 0.55) {
     if (dynamBoxBuf.size() != 0) {
       std::cout << "wrong! dynamBoxBuf != 0 , size is : " << dynamBoxBuf.size() << std::endl;
     }
@@ -155,6 +190,45 @@ public:
       }
       DataAssociationBySSP(matrix, order, reverse_order);
     }
+
+    int descriptor_candidate_num = 0;
+    int descriptor_checked_num = 0;
+    int descriptor_rejected_num = 0;
+    if (descriptor_gate_enable) {
+      for (int n = 0; n < order.size(); n++) {
+        if (order[n] == -1)
+          continue;
+        descriptor_candidate_num++;
+        int de_index = order[n];
+        int ob_frame = tracked_object[n].last_obs.first;
+        int ob_index = tracked_object[n].last_obs.second;
+        if (ob_frame < 0 || ob_frame >= static_cast<int>(frames.size()) ||
+            ob_index < 0 || ob_index >= static_cast<int>(frames[ob_frame].objects.size()))
+          continue;
+
+        // 只对成熟轨迹做宽松几何门控；新生轨迹仍完全沿用原中心距离关联逻辑。
+        bool mature_track = frames[ob_frame].objects[ob_index].initialized || tracked_object[n].num_observations >= 5;
+        if (!mature_track ||
+            !tracked_object[n].has_height_descriptor ||
+            !frames[flow].objects[de_index].has_height_descriptor)
+          continue;
+
+        double sim = DescriptorCosineSimilarity(tracked_object[n].height_descriptor, frames[flow].objects[de_index].height_descriptor);
+        if (sim < 0.0)
+          continue;
+        descriptor_checked_num++;
+        if (sim < descriptor_cos_threshold) {
+          order[n] = -1;
+          reverse_order[de_index] = -1;
+          descriptor_rejected_num++;
+        }
+      }
+      std::cout << "[AssociationDescriptorGate] candidates=" << descriptor_candidate_num
+                << " checked=" << descriptor_checked_num
+                << " rejected=" << descriptor_rejected_num
+                << " threshold=" << descriptor_cos_threshold << std::endl;
+    }
+
     for (int n = 0; n < order.size(); n++) {
       if (order[n] != -1) {
         int de_index = order[n];
