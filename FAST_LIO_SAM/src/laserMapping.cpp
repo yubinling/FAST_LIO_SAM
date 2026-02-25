@@ -282,8 +282,11 @@ struct ObjectLocalMapState {
 
     PointCloudXYZI::Ptr accumulated_cloud;
     PointCloudXYZI::Ptr icp_map_cloud;
+    Eigen::Affine3f anchor_pose_world = Eigen::Affine3f::Identity();
+    int anchor_frame_id = -1;
     int valid_frames = 0;
     int skipped_empty_cloud = 0;
+    bool has_anchor_pose = false;
     bool accumulated_saved = false;
     bool icp_saved = false;
 };
@@ -295,6 +298,12 @@ int objectLocalMapMinValidFrames = 5;
 int objectLocalMapLogInterval = 20;
 bool objectLocalMapPublish = false;
 int objectLocalMapPublishInterval = 5;
+bool objectLocalMapIcpCheckEnable = false;
+int objectLocalMapIcpCheckMinMapPoints = 80;
+int objectLocalMapIcpCheckMinScanPoints = 10;
+int objectLocalMapIcpCheckMaxIterations = 30;
+double objectLocalMapIcpCheckMaxCorrespondence = 0.8;
+double objectLocalMapIcpCheckFitnessThreshold = 0.25;
 std::map<int, ObjectLocalMapState> objectLocalMaps;
 std::ofstream objectLocalMapLogStream;
 
@@ -2933,6 +2942,100 @@ bool extractObjectLocalCloud(const LidarSLAMObject &obj, PointCloudXYZI::Ptr clo
     return !cloudLocal->empty();
 }
 
+Eigen::Affine3f objectOptimizedPoseToAffine(const LidarSLAMObject &obj)
+{
+    std::vector<float> pose_vec = obj.optimize_t;
+    return gtsamPose3toAffine3f(vec6ftoPose3(pose_vec));
+}
+
+void transformObjectCloudToAnchor(const PointCloudXYZI::Ptr &cloudLocal,
+                                  const Eigen::Affine3f &current_pose_world,
+                                  const Eigen::Affine3f &anchor_pose_world,
+                                  PointCloudXYZI::Ptr cloudAnchor)
+{
+    if (!cloudAnchor)
+        return;
+
+    cloudAnchor->clear();
+    if (!cloudLocal || cloudLocal->empty())
+        return;
+
+    cloudAnchor->reserve(cloudLocal->size());
+    const Eigen::Affine3f T_anchor_current = anchor_pose_world.inverse() * current_pose_world;
+
+    // 将当前目标局部坐标系下的点投到首次稳定目标坐标系，形成论文里的目标独立局部地图
+    for (const auto &pt : cloudLocal->points)
+    {
+        Eigen::Vector3f p_anchor = T_anchor_current * Eigen::Vector3f(pt.x, pt.y, pt.z);
+        PointType out = pt;
+        out.x = p_anchor.x();
+        out.y = p_anchor.y();
+        out.z = p_anchor.z();
+        cloudAnchor->push_back(out);
+    }
+}
+
+void checkObjectLocalMapIcp(const LidarSLAMObject &obj,
+                            const PointCloudXYZI::Ptr &cloudLocal,
+                            const ObjectLocalMapState &state)
+{
+    if (!objectLocalMapIcpCheckEnable)
+        return;
+
+    if (!cloudLocal || static_cast<int>(cloudLocal->size()) < objectLocalMapIcpCheckMinScanPoints)
+        return;
+
+    if (state.valid_frames < objectLocalMapMinValidFrames)
+        return;
+
+    const PointCloudXYZI::Ptr &target_cloud =
+        (objectLocalMapIcpMap && state.icp_map_cloud && !state.icp_map_cloud->empty())
+            ? state.icp_map_cloud
+            : state.accumulated_cloud;
+
+    if (!target_cloud || static_cast<int>(target_cloud->size()) < objectLocalMapIcpCheckMinMapPoints)
+        return;
+
+    pcl::IterativeClosestPoint<PointType, PointType> icp;
+    icp.setInputSource(cloudLocal);
+    icp.setInputTarget(target_cloud);
+    icp.setMaximumIterations(objectLocalMapIcpCheckMaxIterations);
+    icp.setMaxCorrespondenceDistance(objectLocalMapIcpCheckMaxCorrespondence);
+    icp.setTransformationEpsilon(1e-6);
+
+    PointCloudXYZI::Ptr aligned(new PointCloudXYZI());
+    icp.align(*aligned);
+
+    Eigen::Matrix4f correction = icp.getFinalTransformation();
+    const double dx = correction(0, 3);
+    const double dy = correction(1, 3);
+    const double dz = correction(2, 3);
+    const double yaw = std::atan2(correction(1, 0), correction(0, 0));
+    const double fitness = icp.hasConverged() ? icp.getFitnessScore() : std::numeric_limits<double>::infinity();
+    const bool accepted = icp.hasConverged() && fitness <= objectLocalMapIcpCheckFitnessThreshold;
+
+    ensureObjectLocalMapLogOpen();
+    if (objectLocalMapLogStream.is_open())
+    {
+        // 这里只记录局部地图 ICP 观测，不改变当前因子图；确认稳定后再升级成后端约束
+        objectLocalMapLogStream << "[objectLocalMapIcpCheck] frame=" << obj.frame_id
+                                << ", object_id=" << obj.object_id
+                                << ", converged=" << (icp.hasConverged() ? 1 : 0)
+                                << ", accepted=" << (accepted ? 1 : 0)
+                                << ", fitness=" << fitness
+                                << ", dx=" << dx
+                                << ", dy=" << dy
+                                << ", dz=" << dz
+                                << ", yaw=" << yaw
+                                << ", scan_points=" << cloudLocal->size()
+                                << ", map_points=" << target_cloud->size()
+                                << ", map_valid_frames=" << state.valid_frames
+                                << ", anchor_frame=" << state.anchor_frame_id
+                                << std::endl;
+        objectLocalMapLogStream.flush();
+    }
+}
+
 void saveTrackedObjectCloudsIfNeeded(bool force_save)
 {
     bool feature_enabled =
@@ -3169,19 +3272,37 @@ void accumulateObjectLocalMaps()
             continue;
         }
 
+        Eigen::Affine3f current_object_pose = objectOptimizedPoseToAffine(obj);
+        if (!state.has_anchor_pose)
+        {
+            state.anchor_pose_world = current_object_pose;
+            state.anchor_frame_id = current_frame.frame_id;
+            state.has_anchor_pose = true;
+        }
+
+        PointCloudXYZI::Ptr cloudAnchor(new PointCloudXYZI());
+        transformObjectCloudToAnchor(cloudLocal, current_object_pose, state.anchor_pose_world, cloudAnchor);
+        if (cloudAnchor->empty())
+        {
+            ++state.skipped_empty_cloud;
+            continue;
+        }
+
+        checkObjectLocalMapIcp(obj, cloudAnchor, state);
+
         if (objectLocalMapAccumulateForPcd)
-            *state.accumulated_cloud += *cloudLocal;
+            *state.accumulated_cloud += *cloudAnchor;
 
         if (objectLocalMapIcpMap)
         {
             if (state.icp_map_cloud->empty())
             {
-                *state.icp_map_cloud += *cloudLocal;
+                *state.icp_map_cloud += *cloudAnchor;
             }
             else
             {
                 pcl::IterativeClosestPoint<PointType, PointType> icp;
-                icp.setInputSource(cloudLocal);
+                icp.setInputSource(cloudAnchor);
                 icp.setInputTarget(state.icp_map_cloud);
                 icp.setMaximumIterations(50);
                 icp.setMaxCorrespondenceDistance(1.0);
@@ -3191,7 +3312,7 @@ void accumulateObjectLocalMaps()
                 if (icp.hasConverged())
                     *state.icp_map_cloud += *aligned;
                 else
-                    *state.icp_map_cloud += *cloudLocal;
+                    *state.icp_map_cloud += *cloudAnchor;
             }
         }
 
@@ -3294,6 +3415,7 @@ void saveObjectLocalMapsIfNeeded(bool force_save)
                     objectLocalMapLogStream << "[objectLocalMap] Saved accumulated PCD: object_id=" << object_id
                                             << ", points=" << state.accumulated_cloud->size()
                                             << ", valid_frames=" << state.valid_frames
+                                            << ", anchor_frame=" << state.anchor_frame_id
                                             << ", skipped_empty_cloud=" << state.skipped_empty_cloud
                                             << " -> " << pcd_path << std::endl;
                 }
@@ -3323,6 +3445,7 @@ void saveObjectLocalMapsIfNeeded(bool force_save)
                     objectLocalMapLogStream << "[objectLocalMap] Saved ICP map PCD: object_id=" << object_id
                                             << ", points=" << state.icp_map_cloud->size()
                                             << ", valid_frames=" << state.valid_frames
+                                            << ", anchor_frame=" << state.anchor_frame_id
                                             << " -> " << pcd_path << std::endl;
                 }
                 else
@@ -4999,6 +5122,12 @@ int main(int argc, char **argv)
     nh.param<int>("limot/objectLocalMapLogInterval", objectLocalMapLogInterval, 20);
     nh.param<bool>("limot/objectLocalMapPublish", objectLocalMapPublish, false);
     nh.param<int>("limot/objectLocalMapPublishInterval", objectLocalMapPublishInterval, 5);
+    nh.param<bool>("limot/objectLocalMapIcpCheckEnable", objectLocalMapIcpCheckEnable, false);
+    nh.param<int>("limot/objectLocalMapIcpCheckMinMapPoints", objectLocalMapIcpCheckMinMapPoints, 80);
+    nh.param<int>("limot/objectLocalMapIcpCheckMinScanPoints", objectLocalMapIcpCheckMinScanPoints, 10);
+    nh.param<int>("limot/objectLocalMapIcpCheckMaxIterations", objectLocalMapIcpCheckMaxIterations, 30);
+    nh.param<double>("limot/objectLocalMapIcpCheckMaxCorrespondence", objectLocalMapIcpCheckMaxCorrespondence, 0.8);
+    nh.param<double>("limot/objectLocalMapIcpCheckFitnessThreshold", objectLocalMapIcpCheckFitnessThreshold, 0.25);
     // nh.param<bool>("limot/pubtrackedobjects", pubtrackedobjects, false);
     nh.param<std::string>("limot/sequence", sequence, "09");
     nh.param<float>("limot/vel_threshold", vel_threshold, 1.0);

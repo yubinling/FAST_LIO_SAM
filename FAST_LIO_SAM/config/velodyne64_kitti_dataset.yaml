@@ -75,6 +75,13 @@ limot:
   objectLocalMapPublish: false
   # 多目标局部地图发布间隔，单位为帧；<=0 时每次更新都发布
   objectLocalMapPublishInterval: 5
+  # 仅用于验证目标局部地图约束质量：当前目标点云与历史 anchor 地图做 ICP 并写日志，不进入后端优化
+  objectLocalMapIcpCheckEnable: false
+  objectLocalMapIcpCheckMinMapPoints: 80
+  objectLocalMapIcpCheckMinScanPoints: 10
+  objectLocalMapIcpCheckMaxIterations: 30
+  objectLocalMapIcpCheckMaxCorrespondence: 0.8
+  objectLocalMapIcpCheckFitnessThreshold: 0.25
 #   pubtrackedobjects
   window_size: 5
   egoP_egoP: 1.0e-6
