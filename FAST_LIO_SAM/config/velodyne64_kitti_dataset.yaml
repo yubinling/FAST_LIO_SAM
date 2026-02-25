@@ -61,6 +61,20 @@ limot:
   frontBoxAccumulateRandomYawDegMax: 10.0
   # 如果为 true，则将每帧目标局部点云通过 ICP 对齐到累计地图，并在保存时输出 *_icp_map.pcd
   frontBoxIcpMap: false
+  # 多目标局部点云地图（默认关闭）：对所有已初始化目标累计局部坐标系点云，退出时保存到 PCD/object_local_maps
+  objectLocalMapEnable: false
+  # true: 保存直接累计的目标局部点云；false: 不输出 *_accumulated.pcd
+  objectLocalMapAccumulateForPcd: true
+  # true: 对每个目标做局部 ICP 累计；较耗时，第一版默认关闭
+  objectLocalMapIcpMap: false
+  # 至少出现多少个有效帧才保存，避免把短暂误检写成目标地图
+  objectLocalMapMinValidFrames: 5
+  # 每隔多少帧写一次轻量日志，<=0 时关闭过程日志
+  objectLocalMapLogInterval: 20
+  # 是否发布合并后的多目标局部地图点云，topic: /limot/object_local_maps
+  objectLocalMapPublish: false
+  # 多目标局部地图发布间隔，单位为帧；<=0 时每次更新都发布
+  objectLocalMapPublishInterval: 5
 #   pubtrackedobjects
   window_size: 5
   egoP_egoP: 1.0e-6

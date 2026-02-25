@@ -147,6 +147,9 @@ string map_file_path, lid_topic, imu_topic;
 void saveObjectTrackingResult();
 void accumulateTrackedObjectCloud();
 void saveTrackedObjectCloudsIfNeeded(bool force_save);
+void accumulateObjectLocalMaps();
+void publishObjectLocalMaps();
+void saveObjectLocalMapsIfNeeded(bool force_save);
 void recordIntermediateFrameForMap(const PointTypePose &currentPose6D);
 void flushPendingIntermediateFramesToAnchor(int new_keyframe_index);
 
@@ -270,6 +273,31 @@ std::ofstream frontBoxLogStream;
 PointCloudXYZI::Ptr frontBoxAccumulatedCloud;
 PointCloudXYZI::Ptr frontBoxIcpMapCloud;
 
+// 多目标局部点云地图：默认关闭，只在需要验证论文里的目标局部建图思路时启用
+struct ObjectLocalMapState {
+    ObjectLocalMapState()
+        : accumulated_cloud(new PointCloudXYZI()),
+          icp_map_cloud(new PointCloudXYZI())
+    {}
+
+    PointCloudXYZI::Ptr accumulated_cloud;
+    PointCloudXYZI::Ptr icp_map_cloud;
+    int valid_frames = 0;
+    int skipped_empty_cloud = 0;
+    bool accumulated_saved = false;
+    bool icp_saved = false;
+};
+
+bool objectLocalMapEnable = false;
+bool objectLocalMapAccumulateForPcd = true;
+bool objectLocalMapIcpMap = false;
+int objectLocalMapMinValidFrames = 5;
+int objectLocalMapLogInterval = 20;
+bool objectLocalMapPublish = false;
+int objectLocalMapPublishInterval = 5;
+std::map<int, ObjectLocalMapState> objectLocalMaps;
+std::ofstream objectLocalMapLogStream;
+
 
 // voxel filter paprams
 float odometrySurfLeafSize;
@@ -348,6 +376,7 @@ ros::Publisher pubTrackedObjects;
 ros::Publisher pubExternalTrackedObject;
 ros::Publisher pubObjectTrajectories;
 ros::Publisher pubTrackedObjectLocalCloud;
+ros::Publisher pubObjectLocalMaps;
 ros::Subscriber subDetect;
 
 
@@ -2061,6 +2090,7 @@ void saveKeyFramesAndFactor()
             // 目标优化完成后，保存当前帧所有目标的优化位姿到文本文件
             saveObjectTrackingResult();
             accumulateTrackedObjectCloud();
+            accumulateObjectLocalMaps();
 
             // 局部因子图优化后，不更新自身姿态，保持原来的transformTobeMapped
             // transformTobeMapped[0] = this_pose.rotation().roll();
@@ -2852,6 +2882,57 @@ void ensureFrontBoxLogOpen()
     frontBoxLogStream.open(log_path, std::ios::out | std::ios::app);
 }
 
+void ensureObjectLocalMapLogOpen()
+{
+    if (objectLocalMapLogStream.is_open())
+        return;
+
+    std::string log_dir = root_dir + "/Log";
+    boost::filesystem::create_directories(log_dir);
+    std::string log_path = log_dir + "/object_local_map.log";
+    objectLocalMapLogStream.open(log_path, std::ios::out | std::ios::app);
+}
+
+bool extractObjectLocalCloud(const LidarSLAMObject &obj, PointCloudXYZI::Ptr cloudLocal)
+{
+    if (!cloudLocal || !feats_undistort || feats_undistort->empty())
+        return false;
+
+    if (!obj.has_detect_pose || obj.obj_status != 1)
+        return false;
+
+    Eigen::Vector3f center_lidar(obj.detect_local_xyz[0], obj.detect_local_xyz[1], obj.detect_local_xyz[2]);
+    float hx = 0.5f * obj.measure_lwh[0];
+    float hy = 0.5f * obj.measure_lwh[1];
+    float hz = 0.5f * obj.measure_lwh[2];
+    float yaw_lidar = obj.detect_rotation_zyx[0];
+    Eigen::Matrix3f R_lidar =
+        Eigen::AngleAxisf(yaw_lidar, Eigen::Vector3f::UnitZ()).toRotationMatrix();
+
+    cloudLocal->clear();
+    cloudLocal->reserve(feats_undistort->size());
+
+    // 将检测框内点变换到目标局部坐标系，后续累计时各帧使用同一局部表达
+    for (const auto &pt : feats_undistort->points)
+    {
+        Eigen::Vector3f p_lidar(pt.x, pt.y, pt.z);
+        Eigen::Vector3f p_local = R_lidar.transpose() * (p_lidar - center_lidar);
+        if (std::fabs(p_local.x()) <= hx &&
+            std::fabs(p_local.y()) <= hy &&
+            std::fabs(p_local.z()) <= hz)
+        {
+            PointType out;
+            out.x = p_local.x();
+            out.y = p_local.y();
+            out.z = p_local.z();
+            out.intensity = pt.intensity;
+            cloudLocal->push_back(out);
+        }
+    }
+
+    return !cloudLocal->empty();
+}
+
 void saveTrackedObjectCloudsIfNeeded(bool force_save)
 {
     bool feature_enabled =
@@ -2963,34 +3044,8 @@ void accumulateTrackedObjectCloud()
         return;
     }
 
-    Eigen::Vector3f center_lidar(selected->detect_local_xyz[0], selected->detect_local_xyz[1], selected->detect_local_xyz[2]);
-    float hx = 0.5f * selected->measure_lwh[0];
-    float hy = 0.5f * selected->measure_lwh[1];
-    float hz = 0.5f * selected->measure_lwh[2];
-    float yaw_lidar = selected->detect_rotation_zyx[0];
-    Eigen::Matrix3f R_lidar =
-        Eigen::AngleAxisf(yaw_lidar, Eigen::Vector3f::UnitZ()).toRotationMatrix();
-
     PointCloudXYZI::Ptr cloudLocal(new PointCloudXYZI());
-    cloudLocal->reserve(feats_undistort->size());
-    for (const auto &pt : feats_undistort->points)
-    {
-        Eigen::Vector3f p_lidar(pt.x, pt.y, pt.z);
-        Eigen::Vector3f p_local = R_lidar.transpose() * (p_lidar - center_lidar);
-        if (std::fabs(p_local.x()) <= hx &&
-            std::fabs(p_local.y()) <= hy &&
-            std::fabs(p_local.z()) <= hz)
-        {
-            PointType out;
-            out.x = p_local.x();
-            out.y = p_local.y();
-            out.z = p_local.z();
-            out.intensity = pt.intensity;
-            cloudLocal->push_back(out);
-        }
-    }
-
-    if (cloudLocal->empty())
+    if (!extractObjectLocalCloud(*selected, cloudLocal))
     {
         ++frontBoxSkipEmptyCloud;
         return;
@@ -3077,6 +3132,224 @@ void accumulateTrackedObjectCloud()
     ++frontBoxPublishFrameCount;
 
     saveTrackedObjectCloudsIfNeeded(false);
+}
+
+void accumulateObjectLocalMaps()
+{
+    bool feature_enabled =
+        objectLocalMapEnable &&
+        (objectLocalMapAccumulateForPcd || objectLocalMapIcpMap);
+
+    if (!feature_enabled)
+        return;
+
+    if (flow < 0 || flow >= static_cast<int>(frames.size()))
+        return;
+
+    if (!feats_undistort || feats_undistort->empty())
+        return;
+
+    const LidarSLAMFrame &current_frame = frames[flow];
+    int candidate_count = 0;
+    int valid_count = 0;
+
+    for (const auto &obj : current_frame.objects)
+    {
+        // 只给已经稳定初始化的跟踪目标建立局部地图，避免临时检测框污染目标点云
+        if (!obj.initialized || obj.object_id < 0)
+            continue;
+
+        ++candidate_count;
+
+        ObjectLocalMapState &state = objectLocalMaps[obj.object_id];
+        PointCloudXYZI::Ptr cloudLocal(new PointCloudXYZI());
+        if (!extractObjectLocalCloud(obj, cloudLocal))
+        {
+            ++state.skipped_empty_cloud;
+            continue;
+        }
+
+        if (objectLocalMapAccumulateForPcd)
+            *state.accumulated_cloud += *cloudLocal;
+
+        if (objectLocalMapIcpMap)
+        {
+            if (state.icp_map_cloud->empty())
+            {
+                *state.icp_map_cloud += *cloudLocal;
+            }
+            else
+            {
+                pcl::IterativeClosestPoint<PointType, PointType> icp;
+                icp.setInputSource(cloudLocal);
+                icp.setInputTarget(state.icp_map_cloud);
+                icp.setMaximumIterations(50);
+                icp.setMaxCorrespondenceDistance(1.0);
+                icp.setTransformationEpsilon(1e-6);
+                PointCloudXYZI::Ptr aligned(new PointCloudXYZI());
+                icp.align(*aligned);
+                if (icp.hasConverged())
+                    *state.icp_map_cloud += *aligned;
+                else
+                    *state.icp_map_cloud += *cloudLocal;
+            }
+        }
+
+        ++state.valid_frames;
+        ++valid_count;
+    }
+
+    if (valid_count > 0 && objectLocalMapLogInterval > 0 &&
+        current_frame.frame_id % objectLocalMapLogInterval == 0)
+    {
+        ensureObjectLocalMapLogOpen();
+        if (objectLocalMapLogStream.is_open())
+        {
+            objectLocalMapLogStream << "[objectLocalMap] frame=" << current_frame.frame_id
+                                    << ", candidates=" << candidate_count
+                                    << ", valid_updates=" << valid_count
+                                    << ", tracked_maps=" << objectLocalMaps.size()
+                                    << std::endl;
+            objectLocalMapLogStream.flush();
+        }
+    }
+
+    publishObjectLocalMaps();
+}
+
+void publishObjectLocalMaps()
+{
+    if (!objectLocalMapEnable || !objectLocalMapPublish)
+        return;
+
+    if (objectLocalMapPublishInterval > 0 &&
+        flow >= 0 && flow < static_cast<int>(frames.size()) &&
+        frames[flow].frame_id % objectLocalMapPublishInterval != 0)
+        return;
+
+    PointCloudXYZI::Ptr mergedCloud(new PointCloudXYZI());
+    for (const auto &item : objectLocalMaps)
+    {
+        const int object_id = item.first;
+        const ObjectLocalMapState &state = item.second;
+        if (state.valid_frames < objectLocalMapMinValidFrames)
+            continue;
+
+        const PointCloudXYZI::Ptr &source_cloud =
+            (objectLocalMapIcpMap && state.icp_map_cloud && !state.icp_map_cloud->empty())
+                ? state.icp_map_cloud
+                : state.accumulated_cloud;
+
+        if (!source_cloud || source_cloud->empty())
+            continue;
+
+        // 合并发布时用 intensity 标记 object_id，RViz 可按强度颜色快速区分不同目标
+        for (const auto &pt : source_cloud->points)
+        {
+            PointType out = pt;
+            out.intensity = static_cast<float>(object_id);
+            mergedCloud->push_back(out);
+        }
+    }
+
+    if (mergedCloud->empty())
+        return;
+
+    publishCloud(&pubObjectLocalMaps, mergedCloud, ros::Time().fromSec(lidar_end_time), "camera_init");
+}
+
+void saveObjectLocalMapsIfNeeded(bool force_save)
+{
+    bool feature_enabled =
+        objectLocalMapEnable &&
+        (objectLocalMapAccumulateForPcd || objectLocalMapIcpMap);
+
+    if (!feature_enabled || !force_save)
+        return;
+
+    ensureObjectLocalMapLogOpen();
+
+    std::string save_dir = root_dir + "/PCD/object_local_maps";
+    boost::filesystem::create_directories(save_dir);
+
+    int saved_objects = 0;
+    for (auto &item : objectLocalMaps)
+    {
+        const int object_id = item.first;
+        ObjectLocalMapState &state = item.second;
+        if (state.valid_frames < objectLocalMapMinValidFrames)
+            continue;
+
+        bool object_saved = false;
+        if (objectLocalMapAccumulateForPcd &&
+            state.accumulated_cloud &&
+            !state.accumulated_cloud->empty())
+        {
+            std::string pcd_path = save_dir + "/object_id_" + std::to_string(object_id) + "_accumulated.pcd";
+            int ret = pcl::io::savePCDFileBinary(pcd_path, *state.accumulated_cloud);
+            if (objectLocalMapLogStream.is_open())
+            {
+                if (ret == 0)
+                {
+                    objectLocalMapLogStream << "[objectLocalMap] Saved accumulated PCD: object_id=" << object_id
+                                            << ", points=" << state.accumulated_cloud->size()
+                                            << ", valid_frames=" << state.valid_frames
+                                            << ", skipped_empty_cloud=" << state.skipped_empty_cloud
+                                            << " -> " << pcd_path << std::endl;
+                }
+                else
+                {
+                    objectLocalMapLogStream << "[objectLocalMap] WARN: failed to save accumulated PCD -> "
+                                            << pcd_path << std::endl;
+                }
+            }
+            if (ret == 0)
+            {
+                state.accumulated_saved = true;
+                object_saved = true;
+            }
+        }
+
+        if (objectLocalMapIcpMap &&
+            state.icp_map_cloud &&
+            !state.icp_map_cloud->empty())
+        {
+            std::string pcd_path = save_dir + "/object_id_" + std::to_string(object_id) + "_icp_map.pcd";
+            int ret = pcl::io::savePCDFileBinary(pcd_path, *state.icp_map_cloud);
+            if (objectLocalMapLogStream.is_open())
+            {
+                if (ret == 0)
+                {
+                    objectLocalMapLogStream << "[objectLocalMap] Saved ICP map PCD: object_id=" << object_id
+                                            << ", points=" << state.icp_map_cloud->size()
+                                            << ", valid_frames=" << state.valid_frames
+                                            << " -> " << pcd_path << std::endl;
+                }
+                else
+                {
+                    objectLocalMapLogStream << "[objectLocalMap] WARN: failed to save ICP map PCD -> "
+                                            << pcd_path << std::endl;
+                }
+            }
+            if (ret == 0)
+            {
+                state.icp_saved = true;
+                object_saved = true;
+            }
+        }
+
+        if (object_saved)
+            ++saved_objects;
+    }
+
+    if (objectLocalMapLogStream.is_open())
+    {
+        objectLocalMapLogStream << "[objectLocalMap] save summary: saved_objects=" << saved_objects
+                                << ", total_maps=" << objectLocalMaps.size()
+                                << ", min_valid_frames=" << objectLocalMapMinValidFrames
+                                << std::endl;
+        objectLocalMapLogStream.flush();
+    }
 }
 
 inline void dump_lio_state_to_log(FILE *fp)
@@ -4719,6 +4992,13 @@ int main(int argc, char **argv)
     nh.param<double>("limot/frontBoxAccumulateRandomYawDegMin", frontBoxAccumulateRandomYawDegMin, -10.0);
     nh.param<double>("limot/frontBoxAccumulateRandomYawDegMax", frontBoxAccumulateRandomYawDegMax, 10.0);
     nh.param<bool>("limot/frontBoxIcpMap", frontBoxIcpMap, false);
+    nh.param<bool>("limot/objectLocalMapEnable", objectLocalMapEnable, false);
+    nh.param<bool>("limot/objectLocalMapAccumulateForPcd", objectLocalMapAccumulateForPcd, true);
+    nh.param<bool>("limot/objectLocalMapIcpMap", objectLocalMapIcpMap, false);
+    nh.param<int>("limot/objectLocalMapMinValidFrames", objectLocalMapMinValidFrames, 5);
+    nh.param<int>("limot/objectLocalMapLogInterval", objectLocalMapLogInterval, 20);
+    nh.param<bool>("limot/objectLocalMapPublish", objectLocalMapPublish, false);
+    nh.param<int>("limot/objectLocalMapPublishInterval", objectLocalMapPublishInterval, 5);
     // nh.param<bool>("limot/pubtrackedobjects", pubtrackedobjects, false);
     nh.param<std::string>("limot/sequence", sequence, "09");
     nh.param<float>("limot/vel_threshold", vel_threshold, 1.0);
@@ -4823,6 +5103,7 @@ int main(int argc, char **argv)
     pubExternalTrackedObject = nh.advertise<visualization_msgs::MarkerArray>("external_tracked_object", 100);
     pubObjectTrajectories = nh.advertise<visualization_msgs::MarkerArray>("object_trajectories", 100);
     pubTrackedObjectLocalCloud = nh.advertise<sensor_msgs::PointCloud2>("/tracked_object_local_cloud", 10);
+    pubObjectLocalMaps = nh.advertise<sensor_msgs::PointCloud2>("/limot/object_local_maps", 1);
     pubGnssPath = nh.advertise<nav_msgs::Path>("/gnss_path", 100000);
     pubGnssPoseGT = nh.advertise<std_msgs::String>("/mypose_gt", 1000); // 发布GNSS IMU位姿真值（TUM格式）
     pubLaserCloudSurround = nh.advertise<sensor_msgs::PointCloud2>("fast_lio_sam/mapping/keyframe_submap", 1); // 发布局部关键帧map的特征点云
@@ -5138,11 +5419,14 @@ int main(int argc, char **argv)
     }
 
     saveTrackedObjectCloudsIfNeeded(true);
+    saveObjectLocalMapsIfNeeded(true);
 
     fout_out.close();
     fout_pre.close();
     if (frontBoxLogStream.is_open())
         frontBoxLogStream.close();
+    if (objectLocalMapLogStream.is_open())
+        objectLocalMapLogStream.close();
 
     if (runtime_pos_log)
     {
