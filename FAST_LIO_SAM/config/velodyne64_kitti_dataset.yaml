@@ -90,6 +90,19 @@ limot:
   objectLocalMapBackendFactorEnable: false
   # 后端弱先验因子噪声，值越大约束越弱；第一版建议保持较弱
   objectLocalMapBackendFactorNoise: 1.0
+  # 后端结果模式：
+  #   0: local_only，只使用局部滑窗联合图的自车+稳定动态目标优化结果
+  #   1: local_plus_global，局部图优化后继续走原全局 gtSAMgraph/isam
+  backendResultMode: 1
+  # local_plus_global 模式下，是否把局部联合图优化后的自车位姿作为弱先验反馈给全局图
+  localGraphFeedbackToGlobal: false
+  # 反馈先验的方差，值越大约束越弱
+  localGraphFeedbackNoise: 10.0
+  # 至少有多少个目标局部地图因子时才允许反馈给全局图
+  localGraphFeedbackMinObjectFactors: 1
+  # 局部图结果相对 Fast-LIO 初值偏差过大时不反馈，避免异常目标拉偏全局图
+  localGraphFeedbackMaxTranslation: 1.0
+  localGraphFeedbackMaxRotation: 0.3
 #   pubtrackedobjects
   window_size: 5
   egoP_egoP: 1.0e-6

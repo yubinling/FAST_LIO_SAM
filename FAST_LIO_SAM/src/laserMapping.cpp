@@ -144,9 +144,12 @@ condition_variable sig_buffer;
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
 
+gtsam::Pose3 Affine3f2Pose3(Eigen::Affine3f T);
+PointTypePose trans2PointTypePose(float transformIn[]);
 void saveObjectTrackingResult();
 void accumulateTrackedObjectCloud();
 void saveTrackedObjectCloudsIfNeeded(bool force_save);
+int addObjectLocalMapFactorsBeforeOptimization();
 void accumulateObjectLocalMaps();
 void publishObjectLocalMaps();
 void saveObjectLocalMapsIfNeeded(bool force_save);
@@ -318,6 +321,12 @@ double objectLocalMapIcpCheckMaxAbsZ = 1.0;
 double objectLocalMapIcpCheckMaxAbsYaw = 0.2;
 bool objectLocalMapBackendFactorEnable = false;
 double objectLocalMapBackendFactorNoise = 1.0;
+int backendResultMode = 1; // 0: local_only, 1: local_plus_global
+bool localGraphFeedbackToGlobal = false;
+double localGraphFeedbackNoise = 10.0;
+int localGraphFeedbackMinObjectFactors = 1;
+double localGraphFeedbackMaxTranslation = 1.0;
+double localGraphFeedbackMaxRotation = 0.3;
 std::map<int, ObjectLocalMapState> objectLocalMaps;
 std::ofstream objectLocalMapLogStream;
 
@@ -619,6 +628,93 @@ Eigen::Affine3f pclPointToAffine3f(PointTypePose thisPoint)
 Eigen::Affine3f trans2Affine3f(float transformIn[])
 {
     return pcl::getTransformation(transformIn[3], transformIn[4], transformIn[5], transformIn[0], transformIn[1], transformIn[2]);
+}
+
+void setTransformTobeMappedFromAffine(const Eigen::Affine3f &pose)
+{
+    float x, y, z, roll, pitch, yaw;
+    pcl::getTranslationAndEulerAngles(pose, x, y, z, roll, pitch, yaw);
+    transformTobeMapped[0] = roll;
+    transformTobeMapped[1] = pitch;
+    transformTobeMapped[2] = yaw;
+    transformTobeMapped[3] = x;
+    transformTobeMapped[4] = y;
+    transformTobeMapped[5] = z;
+}
+
+void applyPoseToEskfState(const Eigen::Affine3f &pose)
+{
+    setTransformTobeMappedFromAffine(pose);
+
+    // local_only 模式下，把局部联合图结果作为当前后端结果写回 ESKF 状态
+    state_ikfom state_updated = kf.get_x();
+    Eigen::Vector3f t = pose.translation();
+    Eigen::Quaternionf qf(pose.rotation());
+    qf.normalize();
+    state_updated.pos = Eigen::Vector3d(t.x(), t.y(), t.z());
+    state_updated.rot = Eigen::Quaterniond(qf.w(), qf.x(), qf.y(), qf.z());
+    state_point = state_updated;
+    kf.change_x(state_updated);
+}
+
+void appendLocalOnlyKeyFrame()
+{
+    PointTypePose thisPose6D = trans2PointTypePose(transformTobeMapped);
+    thisPose6D.time = lidar_end_time;
+
+    PointType thisPose3D;
+    thisPose3D.x = thisPose6D.x;
+    thisPose3D.y = thisPose6D.y;
+    thisPose3D.z = thisPose6D.z;
+    thisPose3D.intensity = cloudKeyPoses3D->size();
+    cloudKeyPoses3D->push_back(thisPose3D);
+
+    thisPose6D.intensity = thisPose3D.intensity;
+    cloudKeyPoses6D->push_back(thisPose6D);
+    keyframeAnchorCapturePoses.push_back(thisPose6D);
+    intermediateFramesPerKeyframe.emplace_back();
+    if (saveMapFrameMode == 1 && saveMapRecordIntermediateFrames && saveMapIntermediateFrameAnchorMode == 1)
+    {
+        flushPendingIntermediateFramesToAnchor(static_cast<int>(cloudKeyPoses6D->size()) - 1);
+    }
+
+    poseCovariance = Eigen::MatrixXd::Identity(6, 6);
+}
+
+void addLocalGraphFeedbackToGlobalIfNeeded(int global_key,
+                                           const Eigen::Affine3f &fast_lio_pose,
+                                           const Eigen::Affine3f &local_optimized_pose,
+                                           int object_map_factor_count)
+{
+    if (!localGraphFeedbackToGlobal)
+        return;
+
+    if (object_map_factor_count < localGraphFeedbackMinObjectFactors)
+        return;
+
+    Eigen::Affine3f delta = fast_lio_pose.inverse() * local_optimized_pose;
+    float dx, dy, dz, droll, dpitch, dyaw;
+    pcl::getTranslationAndEulerAngles(delta, dx, dy, dz, droll, dpitch, dyaw);
+    double trans_norm = std::sqrt(dx * dx + dy * dy + dz * dz);
+    double rot_norm = std::sqrt(droll * droll + dpitch * dpitch + dyaw * dyaw);
+    if (trans_norm > localGraphFeedbackMaxTranslation || rot_norm > localGraphFeedbackMaxRotation)
+    {
+        ROS_WARN_STREAM("[localGraphFeedback] skip global feedback: trans=" << trans_norm
+                        << ", rot=" << rot_norm
+                        << ", object_factors=" << object_map_factor_count);
+        return;
+    }
+
+    // local_plus_global 模式下，只把 local_graph 的自车结果作为弱先验反馈给全局自车图，不把目标节点塞进全局图。
+    gtsam::Vector feedbackNoiseVector6(6);
+    feedbackNoiseVector6 << localGraphFeedbackNoise, localGraphFeedbackNoise, localGraphFeedbackNoise,
+                            localGraphFeedbackNoise, localGraphFeedbackNoise, localGraphFeedbackNoise;
+    gtsam::noiseModel::Base::shared_ptr feedbackNoise =
+        gtsam::noiseModel::Robust::Create(
+            gtsam::noiseModel::mEstimator::Cauchy::Create(rubostNum),
+            gtsam::noiseModel::Diagonal::Variances(feedbackNoiseVector6));
+    gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(
+        global_key, Affine3f2Pose3(local_optimized_pose), feedbackNoise));
 }
 
 /**
@@ -1875,6 +1971,10 @@ void saveKeyFramesAndFactor()
     current_mot_graph_time_ms = 0.0;
     current_global_graph_time_ms = 0.0;
     current_backend_graph_time_ms = 0.0;
+    bool local_graph_optimized_this_frame = false;
+    int object_local_map_factor_count_this_frame = 0;
+    Eigen::Affine3f fast_lio_pose_before_local = trans2Affine3f(transformTobeMapped);
+    Eigen::Affine3f local_optimized_pose_this_frame = fast_lio_pose_before_local;
 
     if (if_dynamic){
         setFrame();//这一帧的object和flow
@@ -1882,6 +1982,7 @@ void saveKeyFramesAndFactor()
         Eigen::Affine3f local_pose = pcl::getTransformation(
             (float)transformTobeMapped[3], (float)transformTobeMapped[4], (float)transformTobeMapped[5],
             (float)transformTobeMapped[0], (float)transformTobeMapped[1], (float)transformTobeMapped[2]);
+        fast_lio_pose_before_local = local_pose;
         // 使用上一帧的 last_pos/last_rot 计算帧间增量：odom_incre = last_pose^{-1} * local_pose
         Eigen::Affine3f odom_incre = Eigen::Affine3f::Identity();
         if (flow > 0) {
@@ -2004,6 +2105,8 @@ void saveKeyFramesAndFactor()
                 }
             }
 
+            object_local_map_factor_count_this_frame = addObjectLocalMapFactorsBeforeOptimization();
+
             // 4. Sliding window, remove old factors
             if (flow >= window_size) {
                 gtsam::Marginals marginals(graph_temp, local_graph.result);
@@ -2093,6 +2196,8 @@ void saveKeyFramesAndFactor()
 
             gtsam::Pose3 this_pose = local_graph.result.at<gtsam::Pose3>(frames[flow].vertex_local_id);
             frames[flow].optimize_pose = gtsamPose3toAffine3f(local_graph.result.at<gtsam::Pose3>(frames[flow].vertex_local_id));
+            local_optimized_pose_this_frame = frames[flow].optimize_pose;
+            local_graph_optimized_this_frame = true;
             for (int k = 0; k < frames[flow].objects.size(); k++) {
                 if (frames[flow].objects[k].vertex_id != -1) {
                     Pose3tovec6f(local_graph.result.at<gtsam::Pose3>(frames[flow].objects[k].vertex_id), frames[flow].objects[k].optimize_t);
@@ -2132,6 +2237,11 @@ void saveKeyFramesAndFactor()
         
 
     }
+    if (backendResultMode == 0 && local_graph_optimized_this_frame)
+    {
+        applyPoseToEskfState(local_optimized_pose_this_frame);
+    }
+
     //  计算当前帧与前一帧位姿变换，如果变化太小，不设为关键帧，反之设为关键帧
     if (saveFrame() == false){
         PointTypePose currentPose6D = trans2PointTypePose(transformTobeMapped);
@@ -2164,9 +2274,36 @@ void saveKeyFramesAndFactor()
         flow++;
         return;
     }
+
+    if (backendResultMode == 0 && local_graph_optimized_this_frame)
+    {
+        double local_only_start = omp_get_wtime();
+        appendLocalOnlyKeyFrame();
+
+        state_ikfom state_now = kf.get_x();
+        last_pos = state_now.pos.cast<double>();
+        Eigen::Vector3d rot_ang = state_now.rot.toRotationMatrix().eulerAngles(2,1,0);
+        last_rot(0) = rot_ang(2);//roll
+        last_rot(1) = rot_ang(1);//pitch
+        last_rot(2) = rot_ang(0);//yaw
+
+        current_global_graph_time_ms = 0.0;
+        current_backend_graph_time_ms = current_mot_graph_time_ms + (omp_get_wtime() - local_only_start) * 1000.0;
+        flow++;
+        return;
+    }
+
     // 激光里程计因子(from fast-lio),  输入的是frame_relative pose  帧间位姿(body 系下)
     double global_graph_start = omp_get_wtime();
+    int current_global_key = cloudKeyPoses3D->size();
     addOdomFactor();
+    if (backendResultMode == 1 && local_graph_optimized_this_frame)
+    {
+        addLocalGraphFeedbackToGlobalIfNeeded(current_global_key,
+                                              fast_lio_pose_before_local,
+                                              local_optimized_pose_this_frame,
+                                              object_local_map_factor_count_this_frame);
+    }
     // GPS因子 (UTM -> WGS84)
     if (use_gnss){
         addGPSFactor();
@@ -3139,6 +3276,67 @@ void addObjectLocalMapBackendFactorIfReady(const LidarSLAMObject &obj,
     }
 }
 
+int addObjectLocalMapFactorsBeforeOptimization()
+{
+    bool feature_enabled =
+        objectLocalMapEnable &&
+        objectLocalMapIcpCheckEnable &&
+        objectLocalMapBackendFactorEnable;
+
+    if (!feature_enabled)
+        return 0;
+
+    if (flow < 0 || flow >= static_cast<int>(frames.size()))
+        return 0;
+
+    if (!feats_undistort || feats_undistort->empty())
+        return 0;
+
+    LidarSLAMFrame &current_frame = frames[flow];
+    int added_factor_count = 0;
+    for (const auto &obj : current_frame.objects)
+    {
+        if (!obj.initialized || obj.object_id < 0 || obj.vertex_id == -1)
+            continue;
+
+        auto it = objectLocalMaps.find(obj.object_id);
+        if (it == objectLocalMaps.end() || !it->second.has_anchor_pose)
+            continue;
+
+        ObjectLocalMapState &state = it->second;
+        PointCloudXYZI::Ptr cloudLocal(new PointCloudXYZI());
+        if (!extractObjectLocalCloud(obj, cloudLocal))
+            continue;
+
+        Eigen::Affine3f current_object_pose = objectOptimizedPoseToAffine(obj);
+        PointCloudXYZI::Ptr cloudAnchor(new PointCloudXYZI());
+        transformObjectCloudToAnchor(cloudLocal, current_object_pose, state.anchor_pose_world, cloudAnchor);
+        if (cloudAnchor->empty())
+            continue;
+
+        const int factor_count_before = state.backend_factor_count;
+        // 在 local_graph 优化前加入目标局部地图匹配因子，使检测观测和 ICP 观测同图优化。
+        checkObjectLocalMapIcp(obj, cloudAnchor, state);
+        addObjectLocalMapBackendFactorIfReady(obj, state, current_object_pose);
+        if (state.backend_factor_count > factor_count_before)
+            ++added_factor_count;
+    }
+
+    if (added_factor_count > 0)
+    {
+        ensureObjectLocalMapLogOpen();
+        if (objectLocalMapLogStream.is_open())
+        {
+            objectLocalMapLogStream << "[objectLocalMapLocalGraph] frame=" << current_frame.frame_id
+                                    << ", added_factors=" << added_factor_count
+                                    << std::endl;
+            objectLocalMapLogStream.flush();
+        }
+    }
+
+    return added_factor_count;
+}
+
 void saveTrackedObjectCloudsIfNeeded(bool force_save)
 {
     bool feature_enabled =
@@ -3391,8 +3589,9 @@ void accumulateObjectLocalMaps()
             continue;
         }
 
-        checkObjectLocalMapIcp(obj, cloudAnchor, state);
-        addObjectLocalMapBackendFactorIfReady(obj, state, current_object_pose);
+        // 旧路径：优化后再计算 ICP 并补弱因子。现在因子已在 StartOptimiz 前加入同一个 local_graph，这里只累计地图。
+        // checkObjectLocalMapIcp(obj, cloudAnchor, state);
+        // addObjectLocalMapBackendFactorIfReady(obj, state, current_object_pose);
 
         if (objectLocalMapAccumulateForPcd)
             *state.accumulated_cloud += *cloudAnchor;
@@ -5238,6 +5437,12 @@ int main(int argc, char **argv)
     nh.param<double>("limot/objectLocalMapIcpCheckMaxAbsYaw", objectLocalMapIcpCheckMaxAbsYaw, 0.2);
     nh.param<bool>("limot/objectLocalMapBackendFactorEnable", objectLocalMapBackendFactorEnable, false);
     nh.param<double>("limot/objectLocalMapBackendFactorNoise", objectLocalMapBackendFactorNoise, 1.0);
+    nh.param<int>("limot/backendResultMode", backendResultMode, 1);
+    nh.param<bool>("limot/localGraphFeedbackToGlobal", localGraphFeedbackToGlobal, false);
+    nh.param<double>("limot/localGraphFeedbackNoise", localGraphFeedbackNoise, 10.0);
+    nh.param<int>("limot/localGraphFeedbackMinObjectFactors", localGraphFeedbackMinObjectFactors, 1);
+    nh.param<double>("limot/localGraphFeedbackMaxTranslation", localGraphFeedbackMaxTranslation, 1.0);
+    nh.param<double>("limot/localGraphFeedbackMaxRotation", localGraphFeedbackMaxRotation, 0.3);
     // nh.param<bool>("limot/pubtrackedobjects", pubtrackedobjects, false);
     nh.param<std::string>("limot/sequence", sequence, "09");
     nh.param<float>("limot/vel_threshold", vel_threshold, 1.0);

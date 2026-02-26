@@ -63,7 +63,7 @@ limot:
   # 如果为 true，则将每帧目标局部点云通过 ICP 对齐到累计地图，并在保存时输出 *_icp_map.pcd
   frontBoxIcpMap: true
   # 多目标局部点云地图（默认关闭）：对所有已初始化目标累计局部坐标系点云，退出时保存到 PCD/object_local_maps
-  objectLocalMapEnable: false
+  objectLocalMapEnable: true
   # true: 保存直接累计的目标局部点云；false: 不输出 *_accumulated.pcd
   objectLocalMapAccumulateForPcd: true
   # true: 对每个目标做局部 ICP 累计；较耗时，第一版默认关闭
@@ -77,7 +77,7 @@ limot:
   # 多目标局部地图发布间隔，单位为帧；<=0 时每次更新都发布
   objectLocalMapPublishInterval: 5
   # 仅用于筛选可进入后端的目标局部地图 ICP 候选观测；本阶段只记录，不改变因子图
-  objectLocalMapIcpCheckEnable: false
+  objectLocalMapIcpCheckEnable: true
   objectLocalMapIcpCheckMinMapPoints: 300
   objectLocalMapIcpCheckMinScanPoints: 50
   objectLocalMapIcpCheckMaxIterations: 30
@@ -88,9 +88,22 @@ limot:
   objectLocalMapIcpCheckMaxAbsZ: 1.0
   objectLocalMapIcpCheckMaxAbsYaw: 0.2
   # 是否将通过质量门控的目标局部地图 ICP 观测作为弱先验因子加入现有后端
-  objectLocalMapBackendFactorEnable: false
+  objectLocalMapBackendFactorEnable: true
   # 后端弱先验因子噪声，值越大约束越弱；第一版建议保持较弱
   objectLocalMapBackendFactorNoise: 1.0
+  # 后端结果模式：
+  #   0: local_only，只使用局部滑窗联合图的自车+稳定动态目标优化结果
+  #   1: local_plus_global，局部图优化后继续走原全局 gtSAMgraph/isam
+  backendResultMode: 1
+  # local_plus_global 模式下，是否把局部联合图优化后的自车位姿作为弱先验反馈给全局图
+  localGraphFeedbackToGlobal: false
+  # 反馈先验的方差，值越大约束越弱
+  localGraphFeedbackNoise: 10.0
+  # 至少有多少个目标局部地图因子时才允许反馈给全局图
+  localGraphFeedbackMinObjectFactors: 1
+  # 局部图结果相对 Fast-LIO 初值偏差过大时不反馈，避免异常目标拉偏全局图
+  localGraphFeedbackMaxTranslation: 1.0
+  localGraphFeedbackMaxRotation: 0.3
   # Scorethre: 0.6                        #recommend: 0.5
   # if_priorfactor: false
   # if_dynamic: false
