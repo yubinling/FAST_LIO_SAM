@@ -289,6 +289,7 @@ struct ObjectLocalMapState {
     int icp_check_count = 0;
     int icp_backend_candidate_count = 0;
     int icp_reject_count = 0;
+    int backend_factor_count = 0;
     bool has_anchor_pose = false;
     bool has_backend_candidate = false;
     Eigen::Affine3f latest_backend_candidate_correction = Eigen::Affine3f::Identity();
@@ -315,6 +316,8 @@ double objectLocalMapIcpCheckMaxAbsX = 1.0;
 double objectLocalMapIcpCheckMaxAbsY = 1.0;
 double objectLocalMapIcpCheckMaxAbsZ = 1.0;
 double objectLocalMapIcpCheckMaxAbsYaw = 0.2;
+bool objectLocalMapBackendFactorEnable = false;
+double objectLocalMapBackendFactorNoise = 1.0;
 std::map<int, ObjectLocalMapState> objectLocalMaps;
 std::ofstream objectLocalMapLogStream;
 
@@ -3094,6 +3097,48 @@ void checkObjectLocalMapIcp(const LidarSLAMObject &obj,
     }
 }
 
+void addObjectLocalMapBackendFactorIfReady(const LidarSLAMObject &obj,
+                                           ObjectLocalMapState &state,
+                                           const Eigen::Affine3f &current_object_pose)
+{
+    if (!objectLocalMapBackendFactorEnable)
+        return;
+
+    if (!state.has_backend_candidate || state.latest_backend_candidate_frame != obj.frame_id)
+        return;
+
+    if (obj.vertex_id == -1)
+        return;
+
+    const Eigen::Affine3f T_anchor_current = state.anchor_pose_world.inverse() * current_object_pose;
+    const Eigen::Affine3f corrected_object_pose =
+        state.anchor_pose_world * state.latest_backend_candidate_correction * T_anchor_current;
+
+    const int factor_id = local_graph.f_id;
+    priorfactor_id[flow].push_back(factor_id);
+    local_graph.AddRobustPriorFactor(obj.vertex_id,
+                                     Affine3f2Pose3(corrected_object_pose),
+                                     objectLocalMapBackendFactorNoise,
+                                     rubostNum);
+
+    ++state.backend_factor_count;
+
+    ensureObjectLocalMapLogOpen();
+    if (objectLocalMapLogStream.is_open())
+    {
+        // 使用弱先验承接目标局部地图 ICP 候选观测，保留原检测观测因子作为主约束
+        objectLocalMapLogStream << "[objectLocalMapBackendFactor] frame=" << obj.frame_id
+                                << ", object_id=" << obj.object_id
+                                << ", vertex_id=" << obj.vertex_id
+                                << ", factor_id=" << factor_id
+                                << ", noise=" << objectLocalMapBackendFactorNoise
+                                << ", fitness=" << state.latest_backend_candidate_fitness
+                                << ", backend_factor_count=" << state.backend_factor_count
+                                << std::endl;
+        objectLocalMapLogStream.flush();
+    }
+}
+
 void saveTrackedObjectCloudsIfNeeded(bool force_save)
 {
     bool feature_enabled =
@@ -3347,6 +3392,7 @@ void accumulateObjectLocalMaps()
         }
 
         checkObjectLocalMapIcp(obj, cloudAnchor, state);
+        addObjectLocalMapBackendFactorIfReady(obj, state, current_object_pose);
 
         if (objectLocalMapAccumulateForPcd)
             *state.accumulated_cloud += *cloudAnchor;
@@ -5190,6 +5236,8 @@ int main(int argc, char **argv)
     nh.param<double>("limot/objectLocalMapIcpCheckMaxAbsY", objectLocalMapIcpCheckMaxAbsY, 1.0);
     nh.param<double>("limot/objectLocalMapIcpCheckMaxAbsZ", objectLocalMapIcpCheckMaxAbsZ, 1.0);
     nh.param<double>("limot/objectLocalMapIcpCheckMaxAbsYaw", objectLocalMapIcpCheckMaxAbsYaw, 0.2);
+    nh.param<bool>("limot/objectLocalMapBackendFactorEnable", objectLocalMapBackendFactorEnable, false);
+    nh.param<double>("limot/objectLocalMapBackendFactorNoise", objectLocalMapBackendFactorNoise, 1.0);
     // nh.param<bool>("limot/pubtrackedobjects", pubtrackedobjects, false);
     nh.param<std::string>("limot/sequence", sequence, "09");
     nh.param<float>("limot/vel_threshold", vel_threshold, 1.0);

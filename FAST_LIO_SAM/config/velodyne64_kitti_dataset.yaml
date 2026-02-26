@@ -86,6 +86,10 @@ limot:
   objectLocalMapIcpCheckMaxAbsY: 1.0
   objectLocalMapIcpCheckMaxAbsZ: 1.0
   objectLocalMapIcpCheckMaxAbsYaw: 0.2
+  # 是否将通过质量门控的目标局部地图 ICP 观测作为弱先验因子加入现有后端
+  objectLocalMapBackendFactorEnable: false
+  # 后端弱先验因子噪声，值越大约束越弱；第一版建议保持较弱
+  objectLocalMapBackendFactorNoise: 1.0
 #   pubtrackedobjects
   window_size: 5
   egoP_egoP: 1.0e-6
