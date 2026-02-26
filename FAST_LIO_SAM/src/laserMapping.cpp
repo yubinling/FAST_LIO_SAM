@@ -286,7 +286,14 @@ struct ObjectLocalMapState {
     int anchor_frame_id = -1;
     int valid_frames = 0;
     int skipped_empty_cloud = 0;
+    int icp_check_count = 0;
+    int icp_backend_candidate_count = 0;
+    int icp_reject_count = 0;
     bool has_anchor_pose = false;
+    bool has_backend_candidate = false;
+    Eigen::Affine3f latest_backend_candidate_correction = Eigen::Affine3f::Identity();
+    int latest_backend_candidate_frame = -1;
+    double latest_backend_candidate_fitness = std::numeric_limits<double>::infinity();
     bool accumulated_saved = false;
     bool icp_saved = false;
 };
@@ -299,11 +306,15 @@ int objectLocalMapLogInterval = 20;
 bool objectLocalMapPublish = false;
 int objectLocalMapPublishInterval = 5;
 bool objectLocalMapIcpCheckEnable = false;
-int objectLocalMapIcpCheckMinMapPoints = 80;
-int objectLocalMapIcpCheckMinScanPoints = 10;
+int objectLocalMapIcpCheckMinMapPoints = 300;
+int objectLocalMapIcpCheckMinScanPoints = 50;
 int objectLocalMapIcpCheckMaxIterations = 30;
 double objectLocalMapIcpCheckMaxCorrespondence = 0.8;
-double objectLocalMapIcpCheckFitnessThreshold = 0.25;
+double objectLocalMapIcpCheckFitnessThreshold = 0.08;
+double objectLocalMapIcpCheckMaxAbsX = 1.0;
+double objectLocalMapIcpCheckMaxAbsY = 1.0;
+double objectLocalMapIcpCheckMaxAbsZ = 1.0;
+double objectLocalMapIcpCheckMaxAbsYaw = 0.2;
 std::map<int, ObjectLocalMapState> objectLocalMaps;
 std::ofstream objectLocalMapLogStream;
 
@@ -2977,7 +2988,7 @@ void transformObjectCloudToAnchor(const PointCloudXYZI::Ptr &cloudLocal,
 
 void checkObjectLocalMapIcp(const LidarSLAMObject &obj,
                             const PointCloudXYZI::Ptr &cloudLocal,
-                            const ObjectLocalMapState &state)
+                            ObjectLocalMapState &state)
 {
     if (!objectLocalMapIcpCheckEnable)
         return;
@@ -3012,16 +3023,61 @@ void checkObjectLocalMapIcp(const LidarSLAMObject &obj,
     const double dz = correction(2, 3);
     const double yaw = std::atan2(correction(1, 0), correction(0, 0));
     const double fitness = icp.hasConverged() ? icp.getFitnessScore() : std::numeric_limits<double>::infinity();
-    const bool accepted = icp.hasConverged() && fitness <= objectLocalMapIcpCheckFitnessThreshold;
+    const double abs_dx = std::fabs(dx);
+    const double abs_dy = std::fabs(dy);
+    const double abs_dz = std::fabs(dz);
+    const double abs_yaw = std::fabs(yaw);
+
+    std::string reject_reason = "ok";
+    bool accepted = true;
+    if (!icp.hasConverged())
+    {
+        accepted = false;
+        reject_reason = "not_converged";
+    }
+    else if (fitness > objectLocalMapIcpCheckFitnessThreshold)
+    {
+        accepted = false;
+        reject_reason = "fitness";
+    }
+    else if (abs_dx > objectLocalMapIcpCheckMaxAbsX ||
+             abs_dy > objectLocalMapIcpCheckMaxAbsY ||
+             abs_dz > objectLocalMapIcpCheckMaxAbsZ)
+    {
+        accepted = false;
+        reject_reason = "translation";
+    }
+    else if (abs_yaw > objectLocalMapIcpCheckMaxAbsYaw)
+    {
+        accepted = false;
+        reject_reason = "yaw";
+    }
+
+    ++state.icp_check_count;
+    if (accepted)
+    {
+        state.has_backend_candidate = true;
+        state.latest_backend_candidate_correction = Eigen::Affine3f::Identity();
+        state.latest_backend_candidate_correction.matrix() = correction;
+        state.latest_backend_candidate_frame = obj.frame_id;
+        state.latest_backend_candidate_fitness = fitness;
+        ++state.icp_backend_candidate_count;
+    }
+    else
+    {
+        ++state.icp_reject_count;
+    }
 
     ensureObjectLocalMapLogOpen();
     if (objectLocalMapLogStream.is_open())
     {
-        // 这里只记录局部地图 ICP 观测，不改变当前因子图；确认稳定后再升级成后端约束
+        // 这里只筛选后端候选观测，不改变当前因子图；真正加因子留到后续后端改造
         objectLocalMapLogStream << "[objectLocalMapIcpCheck] frame=" << obj.frame_id
                                 << ", object_id=" << obj.object_id
                                 << ", converged=" << (icp.hasConverged() ? 1 : 0)
                                 << ", accepted=" << (accepted ? 1 : 0)
+                                << ", backend_candidate=" << (accepted ? 1 : 0)
+                                << ", reject_reason=" << reject_reason
                                 << ", fitness=" << fitness
                                 << ", dx=" << dx
                                 << ", dy=" << dy
@@ -3031,6 +3087,8 @@ void checkObjectLocalMapIcp(const LidarSLAMObject &obj,
                                 << ", map_points=" << target_cloud->size()
                                 << ", map_valid_frames=" << state.valid_frames
                                 << ", anchor_frame=" << state.anchor_frame_id
+                                << ", candidate_count=" << state.icp_backend_candidate_count
+                                << ", reject_count=" << state.icp_reject_count
                                 << std::endl;
         objectLocalMapLogStream.flush();
     }
@@ -5123,11 +5181,15 @@ int main(int argc, char **argv)
     nh.param<bool>("limot/objectLocalMapPublish", objectLocalMapPublish, false);
     nh.param<int>("limot/objectLocalMapPublishInterval", objectLocalMapPublishInterval, 5);
     nh.param<bool>("limot/objectLocalMapIcpCheckEnable", objectLocalMapIcpCheckEnable, false);
-    nh.param<int>("limot/objectLocalMapIcpCheckMinMapPoints", objectLocalMapIcpCheckMinMapPoints, 80);
-    nh.param<int>("limot/objectLocalMapIcpCheckMinScanPoints", objectLocalMapIcpCheckMinScanPoints, 10);
+    nh.param<int>("limot/objectLocalMapIcpCheckMinMapPoints", objectLocalMapIcpCheckMinMapPoints, 300);
+    nh.param<int>("limot/objectLocalMapIcpCheckMinScanPoints", objectLocalMapIcpCheckMinScanPoints, 50);
     nh.param<int>("limot/objectLocalMapIcpCheckMaxIterations", objectLocalMapIcpCheckMaxIterations, 30);
     nh.param<double>("limot/objectLocalMapIcpCheckMaxCorrespondence", objectLocalMapIcpCheckMaxCorrespondence, 0.8);
-    nh.param<double>("limot/objectLocalMapIcpCheckFitnessThreshold", objectLocalMapIcpCheckFitnessThreshold, 0.25);
+    nh.param<double>("limot/objectLocalMapIcpCheckFitnessThreshold", objectLocalMapIcpCheckFitnessThreshold, 0.08);
+    nh.param<double>("limot/objectLocalMapIcpCheckMaxAbsX", objectLocalMapIcpCheckMaxAbsX, 1.0);
+    nh.param<double>("limot/objectLocalMapIcpCheckMaxAbsY", objectLocalMapIcpCheckMaxAbsY, 1.0);
+    nh.param<double>("limot/objectLocalMapIcpCheckMaxAbsZ", objectLocalMapIcpCheckMaxAbsZ, 1.0);
+    nh.param<double>("limot/objectLocalMapIcpCheckMaxAbsYaw", objectLocalMapIcpCheckMaxAbsYaw, 0.2);
     // nh.param<bool>("limot/pubtrackedobjects", pubtrackedobjects, false);
     nh.param<std::string>("limot/sequence", sequence, "09");
     nh.param<float>("limot/vel_threshold", vel_threshold, 1.0);
