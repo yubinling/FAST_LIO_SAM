@@ -327,6 +327,8 @@ double localGraphFeedbackNoise = 10.0;
 int localGraphFeedbackMinObjectFactors = 1;
 double localGraphFeedbackMaxTranslation = 1.0;
 double localGraphFeedbackMaxRotation = 0.3;
+bool hasLastLocalGraphKeyPoseForGlobal = false;
+Eigen::Affine3f lastLocalGraphKeyPoseForGlobal = Eigen::Affine3f::Identity();
 std::map<int, ObjectLocalMapState> objectLocalMaps;
 std::ofstream objectLocalMapLogStream;
 
@@ -689,6 +691,9 @@ void addLocalGraphFeedbackToGlobalIfNeeded(int global_key,
     if (!localGraphFeedbackToGlobal)
         return;
 
+    if (global_key <= 0 || !hasLastLocalGraphKeyPoseForGlobal)
+        return;
+
     if (object_map_factor_count < localGraphFeedbackMinObjectFactors)
         return;
 
@@ -705,7 +710,9 @@ void addLocalGraphFeedbackToGlobalIfNeeded(int global_key,
         return;
     }
 
-    // local_plus_global 模式下，只把 local_graph 的自车结果作为弱先验反馈给全局自车图，不把目标节点塞进全局图。
+    // local_plus_global 模式下，只把 local_graph 的相邻关键帧增量作为弱 Between 因子反馈给全局自车图。
+    Eigen::Affine3f local_between =
+        lastLocalGraphKeyPoseForGlobal.inverse() * local_optimized_pose;
     gtsam::Vector feedbackNoiseVector6(6);
     feedbackNoiseVector6 << localGraphFeedbackNoise, localGraphFeedbackNoise, localGraphFeedbackNoise,
                             localGraphFeedbackNoise, localGraphFeedbackNoise, localGraphFeedbackNoise;
@@ -713,8 +720,15 @@ void addLocalGraphFeedbackToGlobalIfNeeded(int global_key,
         gtsam::noiseModel::Robust::Create(
             gtsam::noiseModel::mEstimator::Cauchy::Create(rubostNum),
             gtsam::noiseModel::Diagonal::Variances(feedbackNoiseVector6));
-    gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(
-        global_key, Affine3f2Pose3(local_optimized_pose), feedbackNoise));
+    gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(
+        global_key - 1, global_key, Affine3f2Pose3(local_between), feedbackNoise));
+}
+
+void updateLocalGraphKeyPoseForGlobal(const Eigen::Affine3f &local_optimized_pose)
+{
+    // 只记录已经成为全局关键帧的 local_graph 位姿，下一关键帧用它形成局部增量约束。
+    lastLocalGraphKeyPoseForGlobal = local_optimized_pose;
+    hasLastLocalGraphKeyPoseForGlobal = true;
 }
 
 /**
@@ -2396,6 +2410,10 @@ void saveKeyFramesAndFactor()
         local_graph.gtSAMgraph2.add(gtsam::PriorFactor<gtsam::Pose3>(
             frames[flow].vertex_local_id, latestEstimate, robustGlobalPoseNoise));
         local_graph.f_id++;
+    }
+    if (backendResultMode == 1 && local_graph_optimized_this_frame)
+    {
+        updateLocalGraphKeyPoseForGlobal(local_optimized_pose_this_frame);
     }
     current_global_graph_time_ms = (omp_get_wtime() - global_graph_start) * 1000.0;
     current_backend_graph_time_ms = current_mot_graph_time_ms + current_global_graph_time_ms;
