@@ -155,6 +155,10 @@ void publishObjectLocalMaps();
 void saveObjectLocalMapsIfNeeded(bool force_save);
 void recordIntermediateFrameForMap(const PointTypePose &currentPose6D);
 void flushPendingIntermediateFramesToAnchor(int new_keyframe_index);
+void saulioOdomHandler(const nav_msgs::Odometry::ConstPtr &msg);
+bool waitSaulioOdom(double target_time, nav_msgs::Odometry &odom_out);
+void applySaulioOdomToEskfState(const nav_msgs::Odometry &odom_msg);
+void publishFilteredCloudForSaulio();
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -177,6 +181,16 @@ vector<double> t_imu_gnss_vec(3, 0.0);
 deque<double> time_buffer;               // 记录lidar时间
 deque<PointCloudXYZI::Ptr> lidar_buffer; //记录特征提取或间隔采样后的lidar（特征）数据
 deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
+deque<nav_msgs::Odometry> saulio_odom_buffer;
+mutex saulio_odom_mutex;
+
+// 前端里程计来源: 0 使用当前 FAST-LIO 前端, 1 使用外部 SAULIO 里程计话题
+int frontend_odom_mode = 0;
+string saulio_odom_topic = "/aft_mapped_to_init";
+string saulio_filtered_cloud_topic = "/sat_slam/saulio_filtered_points";
+double saulio_odom_time_tolerance = 0.05;
+double saulio_odom_wait_timeout = 0.08;
+bool saulio_publish_filtered_cloud = true;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
@@ -411,6 +425,7 @@ ros::Publisher pubExternalTrackedObject;
 ros::Publisher pubObjectTrajectories;
 ros::Publisher pubTrackedObjectLocalCloud;
 ros::Publisher pubObjectLocalMaps;
+ros::Publisher pubSaulioFilteredCloud;
 ros::Subscriber subDetect;
 
 
@@ -657,6 +672,113 @@ void applyPoseToEskfState(const Eigen::Affine3f &pose)
     state_updated.rot = Eigen::Quaterniond(qf.w(), qf.x(), qf.y(), qf.z());
     state_point = state_updated;
     kf.change_x(state_updated);
+}
+
+void saulioOdomHandler(const nav_msgs::Odometry::ConstPtr &msg)
+{
+    std::lock_guard<std::mutex> lock(saulio_odom_mutex);
+    saulio_odom_buffer.push_back(*msg);
+    while (saulio_odom_buffer.size() > 200)
+        saulio_odom_buffer.pop_front();
+}
+
+bool waitSaulioOdom(double target_time, nav_msgs::Odometry &odom_out)
+{
+    double wait_start = ros::Time::now().toSec();
+    ros::Rate wait_rate(1000);
+
+    while (ros::ok())
+    {
+        {
+            std::lock_guard<std::mutex> lock(saulio_odom_mutex);
+            while (!saulio_odom_buffer.empty() &&
+                   saulio_odom_buffer.front().header.stamp.toSec() < target_time - saulio_odom_time_tolerance)
+            {
+                saulio_odom_buffer.pop_front();
+            }
+
+            int best_index = -1;
+            double best_dt = std::numeric_limits<double>::max();
+            for (int i = 0; i < static_cast<int>(saulio_odom_buffer.size()); ++i)
+            {
+                double dt = std::fabs(saulio_odom_buffer[i].header.stamp.toSec() - target_time);
+                if (dt < best_dt)
+                {
+                    best_dt = dt;
+                    best_index = i;
+                }
+                if (saulio_odom_buffer[i].header.stamp.toSec() > target_time + saulio_odom_time_tolerance)
+                    break;
+            }
+
+            if (best_index >= 0 && best_dt <= saulio_odom_time_tolerance)
+            {
+                odom_out = saulio_odom_buffer[best_index];
+                saulio_odom_buffer.erase(saulio_odom_buffer.begin(), saulio_odom_buffer.begin() + best_index + 1);
+                return true;
+            }
+        }
+
+        if (ros::Time::now().toSec() - wait_start > saulio_odom_wait_timeout)
+            return false;
+
+        ros::spinOnce();
+        wait_rate.sleep();
+    }
+
+    return false;
+}
+
+void applySaulioOdomToEskfState(const nav_msgs::Odometry &odom_msg)
+{
+    const geometry_msgs::Pose &pose_msg = odom_msg.pose.pose;
+    Eigen::Quaterniond q(pose_msg.orientation.w,
+                         pose_msg.orientation.x,
+                         pose_msg.orientation.y,
+                         pose_msg.orientation.z);
+    if (q.norm() < 1e-6)
+    {
+        ROS_WARN_THROTTLE(1.0, "[saulio_frontend] invalid odometry quaternion, skip this frame");
+        return;
+    }
+    q.normalize();
+
+    state_ikfom state_updated = kf.get_x();
+    state_updated.pos = Eigen::Vector3d(pose_msg.position.x,
+                                        pose_msg.position.y,
+                                        pose_msg.position.z);
+    state_updated.rot = q;
+    state_point = state_updated;
+    kf.change_x(state_updated);
+
+    Eigen::Affine3f pose = Eigen::Affine3f::Identity();
+    pose.linear() = q.toRotationMatrix().cast<float>();
+    pose.translation() = state_updated.pos.cast<float>();
+    setTransformTobeMappedFromAffine(pose);
+
+    // 外部 SAULIO 前端作为当前帧里程计来源时，后端和可视化仍沿用原来的状态变量。
+    geoQuat.x = q.x();
+    geoQuat.y = q.y();
+    geoQuat.z = q.z();
+    geoQuat.w = q.w();
+}
+
+void publishFilteredCloudForSaulio()
+{
+    if (frontend_odom_mode != 1 || !saulio_publish_filtered_cloud)
+        return;
+
+    if (pubSaulioFilteredCloud.getNumSubscribers() == 0)
+        return;
+
+    if (!feats_undistort || feats_undistort->empty())
+        return;
+
+    sensor_msgs::PointCloud2 cloud_msg;
+    pcl::toROSMsg(*feats_undistort, cloud_msg);
+    cloud_msg.header.stamp = ros::Time().fromSec(lidar_start_time);
+    cloud_msg.header.frame_id = "body";
+    pubSaulioFilteredCloud.publish(cloud_msg);
 }
 
 void appendLocalOnlyKeyFrame()
@@ -5349,6 +5471,12 @@ int main(int argc, char **argv)
 
     // save keyframes
     nh.param<bool>("dense_keyframe", dense_keyframe, true);  // true: 关键帧存储feats_undistort, false: 存储feats_down_body
+    nh.param<int>("frontend_odom_mode", frontend_odom_mode, 0);
+    nh.param<std::string>("saulio_odom_topic", saulio_odom_topic, std::string("/aft_mapped_to_init"));
+    nh.param<std::string>("saulio_filtered_cloud_topic", saulio_filtered_cloud_topic, std::string("/sat_slam/saulio_filtered_points"));
+    nh.param<double>("saulio_odom_time_tolerance", saulio_odom_time_tolerance, 0.05);
+    nh.param<double>("saulio_odom_wait_timeout", saulio_odom_wait_timeout, 0.08);
+    nh.param<bool>("saulio_publish_filtered_cloud", saulio_publish_filtered_cloud, true);
     nh.param<float>("surroundingkeyframeAddingDistThreshold", surroundingkeyframeAddingDistThreshold, 20.0);
     nh.param<float>("surroundingkeyframeAddingAngleThreshold", surroundingkeyframeAddingAngleThreshold, 0.2);
     nh.param<float>("surroundingKeyframeDensity", surroundingKeyframeDensity, 1.0);
@@ -5554,6 +5682,12 @@ int main(int argc, char **argv)
     /*** ROS subscribe initialization ***/
     ros::Subscriber sub_pcl = p_pre->lidar_type == AVIA ? nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
     ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
+    ros::Subscriber sub_saulio_odom;
+    if (frontend_odom_mode == 1)
+    {
+        sub_saulio_odom = nh.subscribe<nav_msgs::Odometry>(saulio_odom_topic, 2000, saulioOdomHandler, ros::TransportHints().tcpNoDelay());
+        ROS_INFO_STREAM("[saulio_frontend] use external SAULIO odometry topic: " << saulio_odom_topic);
+    }
     ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100000);        //  world系下稠密点云
     ros::Publisher pubLaserCloudFull_body = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_body", 100000);      //  body系下稠密点云
     ros::Publisher pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>("/cloud_effected", 100000);         //  no used
@@ -5566,6 +5700,7 @@ int main(int argc, char **argv)
     pubObjectTrajectories = nh.advertise<visualization_msgs::MarkerArray>("object_trajectories", 100);
     pubTrackedObjectLocalCloud = nh.advertise<sensor_msgs::PointCloud2>("/tracked_object_local_cloud", 10);
     pubObjectLocalMaps = nh.advertise<sensor_msgs::PointCloud2>("/limot/object_local_maps", 1);
+    pubSaulioFilteredCloud = nh.advertise<sensor_msgs::PointCloud2>(saulio_filtered_cloud_topic, 20);
     pubGnssPath = nh.advertise<nav_msgs::Path>("/gnss_path", 100000);
     pubGnssPoseGT = nh.advertise<std_msgs::String>("/mypose_gt", 1000); // 发布GNSS IMU位姿真值（TUM格式）
     pubLaserCloudSurround = nh.advertise<sensor_msgs::PointCloud2>("fast_lio_sam/mapping/keyframe_submap", 1); // 发布局部关键帧map的特征点云
@@ -5658,6 +5793,7 @@ int main(int argc, char **argv)
             // 两者都在下采样前执行, 保证后续匹配 / 建图 / 发布使用一致的点云
             filterAllDetectionBoxesOnScan();
             filterPredictedBoxesOnScan();
+            publishFilteredCloudForSaulio();
 
             // 检查当前lidar数据时间，与最早lidar数据时间是否足够
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? false : true;
@@ -5670,6 +5806,24 @@ int main(int argc, char **argv)
             downSizeFilterSurf.filter(*feats_down_body);
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size(); //当前帧降采样后点数
+
+            if (frontend_odom_mode == 1)
+            {
+                nav_msgs::Odometry saulio_odom;
+                if (!waitSaulioOdom(lidar_end_time, saulio_odom))
+                {
+                    ROS_WARN_STREAM_THROTTLE(1.0, "[saulio_frontend] no matched odometry near lidar_end_time="
+                                                  << std::fixed << std::setprecision(6) << lidar_end_time
+                                                  << ", tolerance=" << saulio_odom_time_tolerance
+                                                  << ", wait_timeout=" << saulio_odom_wait_timeout);
+                    continue;
+                }
+
+                // SAULIO 输出作为当前帧前端里程计，后续动态目标跟踪和后端仍复用原 sat-slam 流程。
+                applySaulioOdomToEskfState(saulio_odom);
+                pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                euler_cur = SO3ToEuler(state_point.rot);
+            }
 
             /*** initialize the map kdtree ***/
             if (ikdtree.Root_Node == nullptr)
@@ -5726,14 +5880,21 @@ int main(int argc, char **argv)
             /*** iterated state estimation ***/
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
-            kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time); //预测、更新
-            state_point = kf.get_x();
-            euler_cur = SO3ToEuler(state_point.rot);
-            pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I; // world系下lidar坐标
-            geoQuat.x = state_point.rot.coeffs()[0];                                // world系下当前imu的姿态四元数
-            geoQuat.y = state_point.rot.coeffs()[1];
-            geoQuat.z = state_point.rot.coeffs()[2];
-            geoQuat.w = state_point.rot.coeffs()[3];
+            if (frontend_odom_mode == 1)
+            {
+                solve_H_time = 0.0;
+            }
+            else
+            {
+                kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time); //预测、更新
+                state_point = kf.get_x();
+                euler_cur = SO3ToEuler(state_point.rot);
+                pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I; // world系下lidar坐标
+                geoQuat.x = state_point.rot.coeffs()[0];                                // world系下当前imu的姿态四元数
+                geoQuat.y = state_point.rot.coeffs()[1];
+                geoQuat.z = state_point.rot.coeffs()[2];
+                geoQuat.w = state_point.rot.coeffs()[3];
+            }
 
             double t_update_end = omp_get_wtime();
 

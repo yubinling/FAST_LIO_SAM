@@ -5,6 +5,18 @@ common:
     imu_topic:  /IMU_data         #"/imu/data"
     gnss_topic:  /gps/fix
     time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
+
+# 前端里程计来源：
+#   0: 使用本节点原 FAST-LIO 点面 EKF 前端
+#   1: 使用外部 SAULIO 里程计话题；本节点仍负责检测、动态点剔除、目标跟踪和后端
+frontend_odom_mode: 1
+# SAULIO 默认发布 /aft_mapped_to_init；时间戳需与当前 lidar_end_time 对齐
+saulio_odom_topic: "/aft_mapped_to_init"
+# 若 SAULIO 改为订阅这个话题，就能使用 sat-slam 剔除动态点后的点云做里程计
+saulio_publish_filtered_cloud: true
+saulio_filtered_cloud_topic: "/sat_slam/saulio_filtered_points"
+saulio_odom_time_tolerance: 0.05
+saulio_odom_wait_timeout: 0.08
 #NCLT
 #    lid_topic: "/points_raw"
 #    imu_topic: "/imu_raw"
