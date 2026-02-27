@@ -3,3 +3,6 @@
 *.onnx
 *.engine
 *.plan
+
+# 忽略大型检测模型权重，避免超过 GitHub 单文件大小限制。
+livoxmodel.data-00000-of-00001
