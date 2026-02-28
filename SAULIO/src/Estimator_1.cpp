@@ -1115,8 +1115,9 @@ void h_model_input_bigupdate(state_input &s, esekfom::dyn_share_modified<double>
 	match_time  += match_cost;
 	match_time_h_model_input_bigupdate += match_cost;
 
-	if (bigupdate_effect_num ==0) 
+	if (bigupdate_effect_num == 0 || residual_bigupdate_num <= 0)
 	{
+		// 大更新没有有效残差时直接回退，让 IKFoM 跳过本次观测更新。
 		ekfom_data.valid = false;
 		return;
 	}
@@ -1142,6 +1143,19 @@ void h_model_input_bigupdate(state_input &s, esekfom::dyn_share_modified<double>
 			                                          p_body_crossmat, point_cov_world,
 			                                          ekfom_data.h_x,
 			                                          ekfom_data.z, residual_row);
+		}
+		if (residual_row != residual_bigupdate_num)
+		{
+			std::cout << "[h_model_input_bigupdate] residual row mismatch, expect="
+			          << residual_bigupdate_num << ", actual=" << residual_row << std::endl;
+			if (residual_row <= 0)
+			{
+				ekfom_data.valid = false;
+				return;
+			}
+			// 线/面残差行数出现轻微不一致时，只保留已经安全写入的行。
+			ekfom_data.h_x.conservativeResize(residual_row, Eigen::NoChange);
+			ekfom_data.z.conservativeResize(residual_row);
 		}
 
 
@@ -1267,6 +1281,13 @@ void h_model_input_bigupdate_1(state_input &s, esekfom::dyn_share_modified<doubl
 	match_time_h_model_input_bigupdate_1 += match_cost;
 	//lyb
 
+	if (bigupdate_effect_num == 0 || residual_bigupdate_num <= 0)
+	{
+		// 后续迭代也可能因为匹配质量下降没有有效观测，此时保持上一轮状态。
+		ekfom_data.valid = false;
+		return;
+	}
+
 	double solve_start_  = omp_get_wtime();
 	ekfom_data.M_Noise = 1.0;
 	ekfom_data.h_x.resize(residual_bigupdate_num, 12);
@@ -1288,6 +1309,19 @@ void h_model_input_bigupdate_1(state_input &s, esekfom::dyn_share_modified<doubl
 			                                          p_body_crossmat, point_cov_world,
 			                                          ekfom_data.h_x,
 			                                          ekfom_data.z, residual_row);
+		}
+		if (residual_row != residual_bigupdate_num)
+		{
+			std::cout << "[h_model_input_bigupdate_1] residual row mismatch, expect="
+			          << residual_bigupdate_num << ", actual=" << residual_row << std::endl;
+			if (residual_row <= 0)
+			{
+				ekfom_data.valid = false;
+				return;
+			}
+			// 避免把未填充的观测行交给矩阵求逆。
+			ekfom_data.h_x.conservativeResize(residual_row, Eigen::NoChange);
+			ekfom_data.z.conservativeResize(residual_row);
 		}
 
 	

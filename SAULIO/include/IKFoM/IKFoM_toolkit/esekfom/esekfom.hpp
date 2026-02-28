@@ -499,6 +499,16 @@ namespace esekfom
 				Eigen::Matrix<scalar_type, Eigen::Dynamic, 12> h_x_ = dyn_share.h_x;
 
 				dof_Measurement = h_x_.rows(); // 观测方程个数m
+				if (dof_Measurement <= 0 || dyn_share.z.rows() != dof_Measurement ||
+				    !h_x_.allFinite() || !dyn_share.z.allFinite() || !std::isfinite(R) || R <= 0.0)
+				{
+					// 大更新来自多段累计点云，偶发空观测或异常数值时跳过本轮，避免矩阵求逆崩溃。
+					std::cout << "[saulio bigupdate] skip invalid measurement, rows="
+					          << dof_Measurement << ", z_rows=" << dyn_share.z.rows()
+					          << ", noise=" << R << std::endl;
+					dyn_share.valid = false;
+					continue;
+				}
 				vectorized_state dx;		   // 定义误差状态
 				x_.boxminus(dx, x_propagated); // 获取误差dx
 				dx_new = dx;				   // 用于迭代的误差状态
@@ -922,6 +932,14 @@ namespace esekfom
 				// K_x = K_ * h_x_;
 				// 由于是误差迭代KF，得到的是误差的最优估计！
 				Matrix<scalar_type, n, 1> dx_ = K_h + (K_x - Matrix<scalar_type, n, n>::Identity()) * dx_new; // 误差增量后验 K*h + (K*H - I) dx
+				if (!dx_.allFinite())
+				{
+					// 数值异常时回退到进入本次 bigupdate 前的状态，防止坏状态继续传播。
+					std::cout << "[saulio bigupdate] skip non-finite dx" << std::endl;
+					x_ = x_propagated;
+					P_ = P_propagated;
+					return false;
+				}
                 
 				state x_before = x_; // 加上校正后的误差状态dx_
 				x_.boxplus(dx_);	 // 根据计算得到的误差增量后验，更新状态量
@@ -946,6 +964,14 @@ namespace esekfom
 				if (!t && i == maximum_iter - 2)
 				{
 					dyn_share.converge = true;
+				}
+				if (!dyn_share.converge && i == maximum_iter - 1)
+				{
+					// 最后一轮仍然超过收敛阈值时不做协方差更新，保持上一帧稳定状态。
+					std::cout << "[saulio bigupdate] not converged, rollback update" << std::endl;
+					x_ = x_propagated;
+					P_ = P_propagated;
+					return false;
 				}
 				// 迭代完成后更新误差状态协方差矩阵
 				// 结束迭代后，更新协方差矩阵的后验值，大致上是P=(I-K*H)*P，如论文式19

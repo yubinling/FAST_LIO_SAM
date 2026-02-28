@@ -251,6 +251,13 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_inp
 
 void ImuProcess::UndistortPcl_end(const MeasureGroup &meas,const deque<sensor_msgs::Imu> &imu_list, esekfom::esekf<state_input, 24, input_ikfom> &kf_state, PointCloudXYZI &pcl_out,double acc_cov_input, double gyr_cov_input, double b_gyr_cov ,double b_acc_cov)
 {
+  if (imu_list.size() < 2 || pcl_out.points.empty())
+  {
+    // 发布稠密点云时可能遇到空 IMU 段或空点云，直接跳过去畸变避免访问 front/back/end-1 崩溃。
+    ROS_WARN_STREAM_THROTTLE(1.0, "[saulio] skip UndistortPcl_end, imu_size="
+                                  << imu_list.size() << ", cloud_size=" << pcl_out.points.size());
+    return;
+  }
   /*** add the imu of the last frame-tail to the of current frame-head ***/
   // deque<sensor_msgs::Imu::ConstPtr> v_imu;
   // v_imu.push_back(meas.imu.back());
@@ -301,7 +308,10 @@ void ImuProcess::UndistortPcl_end(const MeasureGroup &meas,const deque<sensor_ms
     auto &&head = it_imu;
     auto &&tail = it_imu + 1;
     
-    if (tail->header.stamp.toSec() < last_lidar_end_time_)    continue;
+    if (tail->header.stamp.toSec() < last_lidar_end_time_)
+    {
+      continue;
+    }
     
     angvel_avr<<0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
                 0.5 * (head->angular_velocity.y + tail->angular_velocity.y),

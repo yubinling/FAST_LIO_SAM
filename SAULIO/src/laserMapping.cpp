@@ -11,7 +11,11 @@
 #include <tf/transform_broadcaster.h>
 #include "li_initialization.h"
 #include <malloc.h>
+#include <cerrno>
+#include <cstring>
 #include <Eigen/Geometry>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include "voxel_map_util.hpp"
 #include "dataio.hpp"
 #include "cfilter.hpp"
@@ -32,11 +36,11 @@ const float MOV_THRESHOLD = 1.5f;
 
 string root_dir = ROOT_DIR;
 string pos_debug_dir = root_dir + "/Log/debug.txt";
-FILE *fp_debug = fopen(pos_debug_dir.c_str(), "w");
+FILE *fp_debug = nullptr;
 string ratio_debug_dir = root_dir + "/Log/ratio.txt";
-FILE *ratio_debug = fopen(ratio_debug_dir.c_str(), "w");
+FILE *ratio_debug = nullptr;
 string pos_debug_dir_1 = root_dir + "/Log/debug_small.txt";
-FILE *fp_debug_1 = fopen(pos_debug_dir_1.c_str(), "w");
+FILE *fp_debug_1 = nullptr;
 
 int time_log_counter = 0; //, publish_count = 0;
 bool start_predict = false;
@@ -106,8 +110,35 @@ void SigHandle(int sig)
     sig_buffer.notify_all();
 }
 
+inline void ensure_saulio_log_dir()
+{
+    const string log_dir = root_dir + "/Log";
+    if (mkdir(log_dir.c_str(), 0775) != 0 && errno != EEXIST)
+    {
+        ROS_WARN_STREAM("[saulio] failed to create log dir: " << log_dir
+                        << ", error=" << std::strerror(errno));
+    }
+}
+
+inline FILE *open_saulio_log_file(const string &file_path)
+{
+    FILE *file = fopen(file_path.c_str(), "w");
+    if (file == nullptr)
+    {
+        ROS_WARN_STREAM("[saulio] failed to open log file: " << file_path
+                        << ", error=" << std::strerror(errno));
+    }
+    return file;
+}
+
 inline void dump_lio_state_to_log(FILE *fp)
 {
+    if (fp == nullptr)
+    {
+        // 日志目录或文件打开失败时不允许继续 fprintf，否则会直接段错误。
+        ROS_WARN_STREAM_THROTTLE(1.0, "[saulio] skip dump_lio_state_to_log because file pointer is null");
+        return;
+    }
     V3D rot_ang;
     if (!use_imu_as_input)
     {
@@ -146,6 +177,12 @@ inline void dump_lio_state_to_log(FILE *fp)
 
 inline void dump_lio_state_to_log_1(FILE *fp)
 {
+    if (fp == nullptr)
+    {
+        // 本地复制 SAULIO 后如果 Log 目录不存在，fopen 会失败，这里保护空指针。
+        ROS_WARN_STREAM_THROTTLE(1.0, "[saulio] skip dump_lio_state_to_log_1 because file pointer is null");
+        return;
+    }
     // V3D rot_ang;
     // if (!use_imu_as_input)
     // {
@@ -681,8 +718,12 @@ int main(int argc, char **argv)
     /*** debug record ***/
 
     FILE *fp;
+    ensure_saulio_log_dir();
+    fp_debug = open_saulio_log_file(pos_debug_dir);
+    ratio_debug = open_saulio_log_file(ratio_debug_dir);
+    fp_debug_1 = open_saulio_log_file(pos_debug_dir_1);
     string pos_log_dir = root_dir + "/Log/pos_log.txt";
-    fp = fopen(pos_log_dir.c_str(), "w");
+    fp = open_saulio_log_file(pos_log_dir);
     open_file();
 
     /*** ROS subscribe initialization ***/
@@ -1440,35 +1481,43 @@ int main(int argc, char **argv)
                         {
                             // Modified: 设置大更新的迭代次数
                             kf_input.maximum_iter = bigupdate_max_iterations;
-                            kf_input.update_iterated_dyn_share_modified_bigupdate();
+                            bool bigupdate_success = kf_input.update_iterated_dyn_share_modified_bigupdate();
 
-
-                            std::size_t required_incre_size = static_cast<std::size_t>(total_incre_num + bigupdate_num);
-                            if (feats_down_incre_world->size() < required_incre_size)
+                            if (bigupdate_success)
                             {
-                                feats_down_incre_world->resize(required_incre_size);
-                            }
-                            if (Nearest_incre_Points.size() < required_incre_size)
-                            {
-                                Nearest_incre_Points.resize(required_incre_size);
-                            }
-                            for (int j = 0; j < bigupdate_num; j++)
-                            {
-                                PointType &point_body_j = feats_down_bigupdate_body->points[j];
-                                // cout<<"body"<<point_body_j.x<<" "<<point_body_j.y<<" "<<point_body_j.z<<endl;
-                                PointType &point_world_j = feats_down_bigupdate_world->points[j];
-                                pointBodyToWorld(&point_body_j, &point_world_j);
+                                std::size_t required_incre_size = static_cast<std::size_t>(total_incre_num + bigupdate_num);
+                                if (feats_down_incre_world->size() < required_incre_size)
+                                {
+                                    feats_down_incre_world->resize(required_incre_size);
+                                }
+                                if (Nearest_incre_Points.size() < required_incre_size)
+                                {
+                                    Nearest_incre_Points.resize(required_incre_size);
+                                }
+                                for (int j = 0; j < bigupdate_num; j++)
+                                {
+                                    PointType &point_body_j = feats_down_bigupdate_body->points[j];
+                                    // cout<<"body"<<point_body_j.x<<" "<<point_body_j.y<<" "<<point_body_j.z<<endl;
+                                    PointType &point_world_j = feats_down_bigupdate_world->points[j];
+                                    pointBodyToWorld(&point_body_j, &point_world_j);
 
-                                // Save all points to unified point cloud without feature segmentation
-                                feats_down_incre_world->points[total_incre_num] = point_world_j;
-                                Nearest_incre_Points[total_incre_num] = Nearest_bigupdate_Points[j];
-                                total_incre_num++; // 积累要更新的点,一次更新需要积累的有：点数，nearestpoints，featsdownworld
-                            }
+                                    // Save all points to unified point cloud without feature segmentation
+                                    feats_down_incre_world->points[total_incre_num] = point_world_j;
+                                    Nearest_incre_Points[total_incre_num] = Nearest_bigupdate_Points[j];
+                                    total_incre_num++; // 积累要更新的点,一次更新需要积累的有：点数，nearestpoints，featsdownworld
+                                }
 
-                            // Modified: add all points to unified ivox
-                            t4 = omp_get_wtime();
-                            MapIncremental_1(feats_down_incre_world, Nearest_incre_Points, ivox_all, total_incre_num);
-                            t5 = omp_get_wtime();
+                                // Modified: add all points to unified ivox
+                                t4 = omp_get_wtime();
+                                MapIncremental_1(feats_down_incre_world, Nearest_incre_Points, ivox_all, total_incre_num);
+                                t5 = omp_get_wtime();
+                            }
+                            else
+                            {
+                                // 大更新发散时状态已在 IKFoM 内回退，本批累计点也不再写入地图。
+                                ROS_WARN_STREAM_THROTTLE(1.0, "[saulio] skip map incremental after failed bigupdate, points="
+                                                            << bigupdate_num);
+                            }
                             bigupdate_effect_num = 0;
                           
                             bigupdate_num = 0;
@@ -1483,17 +1532,26 @@ int main(int argc, char **argv)
                             }
   
                             if (path_en)
+                            {
                                 publish_path_1(pubPath);
+                            }
                             if (scan_pub_en || pcd_save_en)
+                            {
                                 publish_frame_world_1(pubLaserCloudFullRes);
+                            }
                             if (scan_pub_en && scan_body_pub_en)
+                            {
                                 publish_frame_body(pubLaserCloudFullRes_body);
+                            }
                             ii++;
                             if (!publish_odometry_without_downsample)
                             {
                                 publish_odometry_1(pubOdomAftMapped);
                             }
-                            dump_lio_state_to_log_1(fp);
+                            if (runtime_pos_log)
+                            {
+                                dump_lio_state_to_log_1(fp);
+                            }
                             // cout<<"ddd: "<<kf_input.P_<<endl;
                             // }
                             total_incre_num = 0;
