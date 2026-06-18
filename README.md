@@ -1,5 +1,8 @@
 # FAST_LIO_SAM
 
+> 当前 SAT-SLAM 改造版的双前端架构、运行模式和配置说明见
+> [系统架构与运行说明.md](./系统架构与运行说明.md)。
+
 ## Front_end : fastlio2      Back_end : lio_sam
 
 <p align='center'>
